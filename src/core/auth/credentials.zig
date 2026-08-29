@@ -283,6 +283,7 @@ pub fn resolveForProvider(
     preferred: ?Source,
 ) !Resolution {
     switch (provider) {
+        .local => return .{},
         .codex => {
             const credential = switch (mode) {
                 .stored => try loadStoredChatGptCredential(alloc),

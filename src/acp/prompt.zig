@@ -36,6 +36,7 @@ const parent_delivery_projector = @import("../core/subagent/parent_delivery_proj
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
+const local_routing = @import("../core/config/local_routing.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -546,11 +547,20 @@ pub fn handlePrompt(
         if (recovery_checkpoint) |checkpoint| checkpoint.user.text else prompt_text,
     );
     defer alloc.free(owned_prompt);
+    var explicit_bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+    defer explicit_bindings.deinit(alloc);
+    try local_routing.appendAutomaticSkillBindings(
+        alloc,
+        session.provider,
+        owned_prompt,
+        state.skills.items,
+        &explicit_bindings,
+    );
     var explicit_skills = try skill_invocation.buildExplicitPromptSection(
         alloc,
         .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
         owned_prompt,
-        &.{},
+        explicit_bindings.items,
         state.context_limits,
     );
     defer explicit_skills.deinit(alloc);
@@ -696,11 +706,20 @@ pub fn runSubagentChild(
         state.context_limits,
     ) catch return error.OutOfMemory;
     defer bounded_skills.deinit(alloc);
+    var explicit_bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+    defer explicit_bindings.deinit(alloc);
+    try local_routing.appendAutomaticSkillBindings(
+        alloc,
+        admission.provider,
+        message.content,
+        state.skills.items,
+        &explicit_bindings,
+    );
     var explicit_skills = skill_invocation.buildExplicitPromptSection(
         alloc,
         .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
         message.content,
-        &.{},
+        explicit_bindings.items,
         state.context_limits,
     ) catch return error.OutOfMemory;
     defer explicit_skills.deinit(alloc);

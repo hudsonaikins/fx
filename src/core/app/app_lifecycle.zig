@@ -1109,10 +1109,15 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
     const provider = settings.provider orelse .gateway;
-    const model = settings.models.get(provider) orelse switch (provider) {
+    const configured_model = if (provider == .local)
+        io_mod.getenv("FX_LOCAL_MODEL") orelse settings.models.get(provider)
+    else
+        settings.models.get(provider);
+    const model = configured_model orelse switch (provider) {
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .local => io_mod.getenv("FX_LOCAL_MODEL") orelse @import("../../gateway/openai_compatible.zig").default_model,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1149,6 +1154,19 @@ test "startup provider chooses only its provider-scoped model" {
     const grok = try configuredProviderSelection("default/model", &grok_settings);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    var local_settings = config_runtime.Settings{ .provider = .local };
+    local_settings.models.values[@intFromEnum(model_provider.ProviderId.local)] = @constCast("saved-local-model");
+    const local = try configuredProviderSelection("default/model", &local_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.local, local.provider);
+    try std.testing.expectEqualStrings("saved-local-model", local.model);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_LOCAL_MODEL", .value = "search-local-model" },
+    });
+    defer env.deinit();
+    const env_local = try configuredProviderSelection("default/model", &local_settings);
+    try std.testing.expectEqualStrings("search-local-model", env_local.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

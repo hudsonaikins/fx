@@ -23,6 +23,7 @@ pub const ValidateFn = *const fn (
 pub const Adapter = struct {
     source: types.CredentialSource,
     model: []const u8,
+    require_credential: bool = true,
     require_account: bool = false,
     validate_fn: ValidateFn,
     build_fn: BuildFn,
@@ -40,7 +41,7 @@ pub fn review(
     request: permission_auto_classifier.ReviewRequest,
     adapter: Adapter,
 ) !permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) return .invalid;
+    if (adapter.require_credential and input.credential.len == 0) return .invalid;
     if (adapter.require_account and input.account_id == null) return .invalid;
     adapter.validate_fn(alloc, input) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;

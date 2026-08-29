@@ -81,6 +81,7 @@ const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
+const local_routing = @import("../config/local_routing.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
@@ -1450,7 +1451,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
+    if (!options.continue_recovery and options.resume_target == null and
+        startup.credential == null and startup.provider != .local)
+    {
         return missingCredentialResult(alloc, options, startup.provider);
     }
 
@@ -1530,50 +1533,59 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_final_model = if (startup.credential) |credential|
-        model_provider.authorizesCredential(ctx.provider, credential.source)
-    else
-        false;
-    const credential: *const credentials.Credential = if (startup_matches_final_model)
-        &startup.credential.?
-    else routed: {
-        const preferred = if (startup.credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            .refresh_if_needed,
-            ctx.provider,
-            preferred,
-        );
-        routed_credential = resolution.credential;
-        if (routed_credential == null) {
-            return missingCredentialResult(alloc, options, ctx.provider);
-        }
-        break :routed &routed_credential.?;
-    };
-    const api_key = credential.token;
-    ctx.api_key = api_key;
-    ctx.gateway_team = credential.gatewayTeam();
-    ctx.credential_source = credential.source;
-    ctx.account_id = credential.accountId();
-    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
-        credential.source,
-        api_key,
-        credential.gatewayTeam(),
-        credential.accountId(),
-    );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-            ctx.session.usage.replaceProviderReconciliationCredential(
+    var api_key: []u8 = &.{};
+    var gateway_team: ?[]const u8 = null;
+    var credential_source: ?types.CredentialSource = null;
+    var account_id: ?[]const u8 = null;
+    if (ctx.provider != .local) {
+        const startup_matches_final_model = if (startup.credential) |credential|
+            model_provider.authorizesCredential(ctx.provider, credential.source)
+        else
+            false;
+        const credential: *const credentials.Credential = if (startup_matches_final_model)
+            &startup.credential.?
+        else routed: {
+            const preferred = if (startup.credential) |value| value.source else null;
+            const resolution = try credentials.resolveForProvider(
                 alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
+                .refresh_if_needed,
                 ctx.provider,
-                credential.source,
-                credential.accountId(),
-                credential.token,
+                preferred,
             );
+            routed_credential = resolution.credential;
+            if (routed_credential == null) {
+                return missingCredentialResult(alloc, options, ctx.provider);
+            }
+            break :routed &routed_credential.?;
+        };
+        api_key = credential.token;
+        gateway_team = credential.gatewayTeam();
+        credential_source = credential.source;
+        account_id = credential.accountId();
+        ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+            credential.source,
+            api_key,
+            credential.gatewayTeam(),
+            credential.accountId(),
+        );
+        if (comptime @import("builtin").os.tag != .wasi) {
+            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
+                ctx.session.usage.replaceProviderReconciliationCredential(
+                    alloc,
+                    ctx.provider,
+                    credential.source,
+                    credential.accountId(),
+                    credential.token,
+                );
+            }
         }
     }
+    ctx.api_key = api_key;
+    ctx.gateway_team = gateway_team;
+    ctx.credential_source = credential_source;
+    ctx.account_id = account_id;
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1681,7 +1693,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
-    }, session_child_capability != null);
+    }, session_child_capability != null and ctx.provider != .local);
     defer tool_projection.deinit(alloc);
 
     const skills_view = skill_runtime.Runtime{
@@ -1693,11 +1705,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     const skills_section = bounded_skills.text;
+    var explicit_bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+    defer explicit_bindings.deinit(alloc);
+    try local_routing.appendAutomaticSkillBindings(
+        alloc,
+        ctx.provider,
+        owned_prompt,
+        loaded_skills.skills,
+        &explicit_bindings,
+    );
     var explicit_skills = try skill_invocation.buildExplicitPromptSection(
         alloc,
         .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         owned_prompt,
-        &.{},
+        explicit_bindings.items,
         ctx.context_limits,
     );
     defer explicit_skills.deinit(alloc);
@@ -1725,9 +1746,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
         .api_key = api_key,
-        .gateway_team = if (credential.gatewayTeam()) |team| @constCast(team) else null,
-        .credential_source = credential.source,
-        .account_id = if (credential.accountId()) |account_id| @constCast(account_id) else null,
+        .gateway_team = if (gateway_team) |team| @constCast(team) else null,
+        .credential_source = credential_source,
+        .account_id = if (account_id) |value| @constCast(value) else null,
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,

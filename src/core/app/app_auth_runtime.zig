@@ -56,10 +56,12 @@ pub fn Runtime(comptime App: type) type {
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
+                if (provider == .local) return true;
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
+                    .local => unreachable,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -1398,6 +1400,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
                 .gateway => unreachable,
+                .local => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

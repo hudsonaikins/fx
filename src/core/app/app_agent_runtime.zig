@@ -26,6 +26,7 @@ const model_provider = @import("../config/model_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const local_routing = @import("../config/local_routing.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
@@ -931,16 +932,24 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
             }
             const skills_section = bounded_skills.text;
-            const explicit_bindings = try std.heap.c_allocator.alloc(skill_invocation.ExplicitBinding, job.skill_bindings.len);
-            defer std.heap.c_allocator.free(explicit_bindings);
-            for (job.skill_bindings, 0..) |binding, index| {
-                explicit_bindings[index] = .{ .name = binding.name, .path = binding.path };
+            var explicit_bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+            defer explicit_bindings.deinit(std.heap.c_allocator);
+            try explicit_bindings.ensureTotalCapacity(std.heap.c_allocator, job.skill_bindings.len + 2);
+            for (job.skill_bindings) |binding| {
+                try explicit_bindings.append(std.heap.c_allocator, .{ .name = binding.name, .path = binding.path });
             }
+            try local_routing.appendAutomaticSkillBindings(
+                std.heap.c_allocator,
+                job.provider,
+                job.prompt,
+                app.skills.items,
+                &explicit_bindings,
+            );
             var explicit_skills = try skill_invocation.buildExplicitPromptSection(
                 std.heap.c_allocator,
                 .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
                 job.prompt,
-                explicit_bindings,
+                explicit_bindings.items,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer explicit_skills.deinit(std.heap.c_allocator);
@@ -1044,11 +1053,20 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer bounded_skills.deinit(alloc);
+            var explicit_bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+            defer explicit_bindings.deinit(alloc);
+            try local_routing.appendAutomaticSkillBindings(
+                alloc,
+                admission.provider,
+                message.content,
+                app.skills.items,
+                &explicit_bindings,
+            );
             var explicit_skills = skill_invocation.buildExplicitPromptSection(
                 alloc,
                 .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
                 message.content,
-                &.{},
+                explicit_bindings.items,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
@@ -1069,6 +1087,11 @@ pub fn Runtime(comptime App: type) type {
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .grok = .{
+                        .capabilities = tool_context.provider_capabilities,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
+                    },
+                    .local = .{
                         .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,

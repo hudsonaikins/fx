@@ -697,11 +697,35 @@ fn activateProviderSelection(
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
+    if (target == .local) {
+        const selected_model = io_mod.getenv("FX_LOCAL_MODEL") orelse
+            settings.models.get(.local) orelse
+            @import("../../gateway/openai_compatible.zig").default_model;
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = .local,
+            .model_preference = .{ .provider = .local, .model = selected_model },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeProviderActivationError(alloc, deps, caller, "failed to save local provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        if (already_selected and caller == .provider_command) {
+            try writeStdout(deps, "Local is already selected.\n");
+        } else if (caller == .provider_command) {
+            try writeStdout(deps, "Provider set to Local.\n");
+        }
+        return true;
+    }
     if (caller == .provider_command and already_selected and resolution.credential != null) {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .local => "Local is already selected.\n",
         });
         return true;
     }
@@ -749,6 +773,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .local => unreachable,
             },
         );
         return false;
@@ -758,6 +783,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .local => unreachable,
         });
         return false;
     };
@@ -803,12 +829,14 @@ fn activateProviderSelection(
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .gateway => unreachable,
+        .local => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .local => "Provider set to Local.\n",
         });
     }
     return true;
@@ -985,6 +1013,10 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .local => {
+                    try writeStderr(deps, "fx login: Local provider needs no login; use fx provider local\n");
+                    return .handled_failure;
+                },
             }
             return .handled_success;
         },
@@ -1079,11 +1111,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|local>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or local\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1179,6 +1211,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .local => "fx models: Local provider has no remote model catalog; configure FX_LOCAL_MODEL or settings.models.local\n",
                 });
                 return .handled_failure;
             };
@@ -2037,7 +2070,7 @@ fn statusSnapshotFromStartupWithBuild(
         .model = startup.selected_model,
         .provider = startup.provider,
         .auth = startup.auth,
-        .auth_help = startup.auth.missingHelp(.cli),
+        .auth_help = if (startup.provider == .local) null else startup.auth.missingHelp(.cli),
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
         .workspace_root = startup.workspace_root,
         .history_turns = 0,

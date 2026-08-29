@@ -651,6 +651,7 @@ pub fn loadStatusSnapshotForProvider(
     provider: ?model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) !StatusSnapshot {
+    if (provider == .local) return .{};
     const chatgpt_connected = credentials.sourceExists(
         alloc,
         secret_store,
@@ -1605,6 +1606,7 @@ pub const Runtime = struct {
                     probeCredentialSource,
                     loadRuntimeCredentialSource,
                 )),
+            .local => false,
         };
     }
 
