@@ -2,10 +2,14 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const default_startup_timeout_ms: u32 = 10_000;
+pub const default_startup_timeout_ms: u32 = 30_000;
 pub const default_operation_timeout_ms: u32 = 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
+
+test "MCP default startup timeout allows thirty-second cold starts" {
+    try std.testing.expectEqual(@as(u32, 30_000), default_startup_timeout_ms);
+}
 
 pub const max_profile_config_warning_key_bytes: usize = 128;
 

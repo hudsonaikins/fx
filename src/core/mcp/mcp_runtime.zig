@@ -27,6 +27,7 @@ const operation_control = @import("operation_control.zig");
 const controlled_lock = @import("controlled_lock.zig");
 const mcp_json = @import("mcp_json.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
+const docker_run = @import("docker_run.zig");
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
 const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
@@ -3275,8 +3276,8 @@ fn configuredAuthenticationState(server: *const McpServer) health.Authentication
 }
 
 fn serverAuthenticationState(server: *const McpServer) health.AuthenticationState {
-    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
     if (server.auth_challenge_present.load(.acquire)) return .required;
+    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
     return configuredAuthenticationState(server);
 }
 
@@ -3344,7 +3345,10 @@ fn healthFailureForState(
         return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
     }
     if (authentication == .required) {
-        return @as(?[]u8, try alloc.dupe(u8, "Authentication is required; run /mcp auth <name> --open."));
+        return @as(?[]u8, try alloc.dupe(
+            u8,
+            "Authentication is required or the saved credentials lack access; run /mcp auth <name> --open and check server permissions.",
+        ));
     }
     if (connection == .failed) {
         return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
@@ -4926,10 +4930,9 @@ pub const McpRuntime = struct {
         return false;
     }
 
-    pub fn pendingWorkspaceNamesForPhase(
+    pub fn pendingWorkspaceNames(
         self: *const McpRuntime,
         alloc: Allocator,
-        phase: startup_admission.Phase,
     ) ![][]u8 {
         var names: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -4937,14 +4940,9 @@ pub const McpRuntime = struct {
             names.deinit(alloc);
         }
         for (self.servers.items) |server| {
-            if (server.config.source != .workspace or
-                server.config.workspace_admission != .pending or
-                startup_admission.decide(
-                    server.config.enabled,
-                    server.config.required,
-                    server.config.workspace_admission,
-                    phase,
-                ) != .connect) continue;
+            if (!server.config.enabled or
+                server.config.source != .workspace or
+                server.config.workspace_admission != .pending) continue;
             const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
             errdefer alloc.free(owned_name);
             try names.append(alloc, owned_name);
@@ -6445,7 +6443,9 @@ pub const McpRuntime = struct {
                 });
             };
             break :result switch (validation) {
-                .valid, .server_authoritative => tool_mcp_runtime.ValidationResult.valid,
+                .valid, .server_authoritative => @as(tool_mcp_runtime.ValidationResult, .{
+                    .valid = self.generation,
+                }),
                 .invalid => |violation| @as(tool_mcp_runtime.ValidationResult, .{
                     .invalid = try std.fmt.allocPrint(
                         arena,
@@ -6467,6 +6467,9 @@ pub const McpRuntime = struct {
         max_tool_result_bytes: usize,
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
+        if (options.expected_runtime_generation) |expected| {
+            if (expected != self.generation) return error.McpAuthorityChanged;
+        }
         if (self.isDiscovering()) return null;
         var operation_access = try OperationAccessGuard.init(
             self.alloc,
@@ -9184,6 +9187,18 @@ test "a newer pending challenge invalidates interactive authentication publicati
     );
 }
 
+test "pending authentication challenge overrides stored credential health" {
+    const server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_credentials_present = .init(true),
+        .auth_challenge_present = .init(true),
+    };
+    try std.testing.expectEqual(
+        health.AuthenticationState.required,
+        serverAuthenticationState(&server),
+    );
+}
+
 test "logout detachment fences auth publication until rollback" {
     var server = McpServer{
         .config = .{ .name = "fixture" },
@@ -10337,8 +10352,17 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
     const generation = server.next_generation;
     server.next_generation = std.math.add(u64, generation, 1) catch
         return error.McpGenerationExhausted;
+    var prepared = try docker_run.prepare(alloc, argv);
+    defer prepared.deinit(alloc);
+    var docker_cleanup = prepared.takeCleanup();
+    defer if (docker_cleanup) |*cleanup| cleanup.deinit(alloc);
+    if (docker_cleanup) |*cleanup| {
+        if (server.env_map) |*environment| {
+            try cleanup.cloneEnvironment(alloc, environment);
+        }
+    }
     const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = argv,
+        .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -10346,13 +10370,20 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
 
-    server.dispatcher = try stdio_dispatcher.StdioDispatcher.create(
+    server.dispatcher = stdio_dispatcher.StdioDispatcher.create(
         alloc,
         std.heap.c_allocator,
         child,
         generation,
         mcp_discovery_response_frame_cap_bytes,
-    );
+    ) catch |err| {
+        if (docker_cleanup) |*cleanup| cleanup.run(alloc);
+        return err;
+    };
+    if (docker_cleanup) |cleanup| {
+        server.dispatcher.?.installDockerCleanup(cleanup);
+        docker_cleanup = null;
+    }
 }
 
 fn connectServerLegacy(
@@ -12396,6 +12427,9 @@ fn authorizeForChallenge(
         save_result.repaired_entries,
     );
     installAuthCredentials(alloc, server, &credentials);
+    if (server.pending_auth_challenge) |*pending| pending.deinit(alloc);
+    server.pending_auth_challenge = null;
+    server.auth_challenge_present.store(false, .release);
     credentials_transferred = true;
 }
 
@@ -15984,11 +16018,14 @@ test "legacy stdio initialization transitions are bounded and monotonic" {
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
         .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
         .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
@@ -16620,15 +16657,16 @@ test "modern MCP calls delegate unsupported schema assertions to the server" {
     const server = &runtime.servers.items[0];
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.ValidationResult.valid,
-        try runtime.validateToolArgumentsByName(
-            alloc,
-            "mcp_provider_provider_pattern",
-            \\{"email":"person@example.com"}
-            ,
-        ),
+    const valid = try runtime.validateToolArgumentsByName(
+        alloc,
+        "mcp_provider_provider_pattern",
+        \\{"email":"person@example.com"}
+        ,
     );
+    switch (valid) {
+        .valid => |generation| try std.testing.expectEqual(runtime.generation, generation),
+        .invalid, .not_available => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(
         error.McpInvalidToolArguments,
         runtime.callToolByName(
@@ -18571,6 +18609,22 @@ test "scoped MCP cached tool and feature operations reject authority revoked aft
             &.{},
             null,
             access,
+        ),
+    );
+}
+
+test "MCP tool call rejects mismatched expected runtime generation before lookup" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.callToolByNameWithOptions(
+            std.testing.allocator,
+            "mcp_fixture_echo",
+            "{}",
+            1024,
+            .{ .expected_runtime_generation = runtime.generation + 1 },
         ),
     );
 }

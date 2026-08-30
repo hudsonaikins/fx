@@ -582,6 +582,7 @@ fn pushQueuedPromptBannerRows(
         var summary = try input_presentation.composeQueuedSummaryRow(
             alloc,
             ctx.queued_count,
+            ctx.steering_count,
             ctx.queued_paused,
             width,
         );
@@ -593,6 +594,7 @@ fn pushQueuedPromptBannerRows(
                 width,
                 false,
                 ctx.queued_cancel_all_available,
+                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -716,6 +718,7 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
+            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }
@@ -1056,8 +1059,7 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .review => "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
-        .full => "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        .full => "Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
         .inline_mode => unreachable,
     };
 
@@ -1348,7 +1350,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     };
     defer shell.deinit(alloc);
     var ctx = testContext(&input);
-    ctx.transcript_depth = .review;
+    ctx.transcript_depth = .full;
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
@@ -1367,7 +1369,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1401,7 +1403,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
 }
 

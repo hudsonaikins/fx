@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.6";
+pub const version = "0.0.7";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -355,6 +355,21 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
+const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+const app_api_key_validator = if (host_target.is_wasm)
+    api_key_validator.unavailable_provider
+else
+    builtin_gateway.api_key_validator;
+const app_oauth_transport = if (selected_host_profile.js_host_auth)
+    js_host_auth.oauth_provider
+else if (selected_host_profile.native_auth)
+    builtin_gateway.oauth_transport_provider
+else
+    oauth_transport.unavailable_provider;
+const app_secret_store = if (host_target.is_wasm)
+    host.unavailable_secret_store
+else
+    native_host.secret_store;
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
@@ -368,7 +383,7 @@ fn currentBuild() update_target.CurrentBuild {
 
 const App = struct {
     pub const app_version = version;
-    pub const host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+    pub const host_profile = selected_host_profile;
     pub const input_limits = paste_framing.default_input_limits;
     pub const build_update_channel = compiled_update_channel;
     pub const build_revision = build_options.git_commit;
@@ -490,14 +505,9 @@ const App = struct {
     terminal: TerminalState = .{},
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
-        if (host_target.is_wasm) api_key_validator.unavailable_provider else builtin_gateway.api_key_validator,
-        if (host_profile.js_host_auth)
-            js_host_auth.oauth_provider
-        else if (host_profile.native_auth)
-            builtin_gateway.oauth_transport_provider
-        else
-            oauth_transport.unavailable_provider,
-        if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
+        app_api_key_validator,
+        app_oauth_transport,
+        app_secret_store,
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
@@ -586,6 +596,10 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .auth = undefined,
+            .usage_dashboard = undefined,
+            .session_persistence = undefined,
+            .shell = TranscriptRuntime.init(),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
@@ -597,6 +611,14 @@ const App = struct {
             else
                 background_process.provider),
         };
+        auth_runtime.Runtime.initInto(
+            &app.auth,
+            app_api_key_validator,
+            app_oauth_transport,
+            app_secret_store,
+        );
+        usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
+        app_session_runtime.Persistence.initInto(&app.session_persistence);
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -1037,7 +1059,12 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
+            .queue,
         );
+    }
+
+    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
+        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -1066,14 +1093,18 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
+            .queue,
         );
     }
+
+    const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1098,6 +1129,7 @@ const App = struct {
             prompt,
             skill_tokens,
             review_draft,
+            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1142,6 +1174,7 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
+            .queue,
         )) return error.PendingPromptQueueRejected;
         WorkerAppRuntime.syncState(
             self,
@@ -1295,6 +1328,7 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         return self.snapshotAndQueuePrompt(
             prompt,
@@ -1304,6 +1338,7 @@ const App = struct {
             null,
             0,
             false,
+            intent,
         );
     }
 
@@ -1323,6 +1358,7 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
+            .queue,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1340,6 +1376,7 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
+        intent: PromptSubmitIntent,
     ) !bool {
         try self.reloadSkills();
 
@@ -1435,7 +1472,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        try self.worker.admitPrompt(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1457,7 +1494,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        });
+        }, recovery_checkpoint == null and intent == .steer);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -2730,6 +2767,14 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
         }
+        if (try self.shell.pollFullTranscriptPageLoad()) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
+        if (self.subagents.childConversationRuntime()) |child| {
+            if (try child.pollFullTranscriptPageLoad()) {
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
+        }
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             const input_now_ms = io_mod.milliTimestamp();
             InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
@@ -3913,13 +3958,13 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
     const wide = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(wide);
     try std.testing.expect(std.mem.find(u8, wide, "text") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "┌") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "└") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "─") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "│") == null);
     try std.testing.expect(std.mem.find(u8, wide, "  abcdefghijkl") != null);
 
     const narrow = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 12, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n  │   efgh │\n") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n    ijkl\n") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 12);
@@ -4158,7 +4203,6 @@ test {
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
-    _ = @import("tools/filesystem/semantic_search.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");

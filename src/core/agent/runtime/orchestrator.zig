@@ -26,7 +26,6 @@ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
-const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
 const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
@@ -332,12 +331,15 @@ fn agent_terminal_lease_transition(
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
     const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
-    if (!std.mem.eql(u8, action.string, "write")) return null;
+    const is_write = std.mem.eql(u8, action.string, "write");
+    const is_close = std.mem.eql(u8, action.string, "close");
+    if (!is_write and !is_close) return null;
     const session_id = parsed.object.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
     if (session_id != .string) {
         return error.InvalidTerminalLeaseTrackingInput;
     }
+    if (is_close) return .{ .remove = session_id.string };
     const lease_value = parsed.object.get("lease");
     const lease_absent = lease_value == null or terminal_lease_is_absent(lease_value.?);
     if (lease_absent) {
@@ -358,7 +360,7 @@ fn agent_terminal_lease_transition(
     };
 }
 
-test "agent terminal lease transitions derive from normalized validated write intent" {
+test "agent terminal lease transitions derive from normalized validated actions" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -427,6 +429,22 @@ test "agent terminal lease transitions derive from normalized validated write in
             ),
             .track, .remove => unreachable,
         }
+    }
+    const close = (try agent_terminal_lease_transition(
+        arena,
+        registry,
+        .{
+            .id = "close",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-one\",\"close_policy\":\"force\"}",
+        },
+    )).?;
+    switch (close) {
+        .remove => |session_id| try std.testing.expectEqualStrings(
+            "terminal-one",
+            session_id,
+        ),
+        .track, .atomic => unreachable,
     }
     try std.testing.expect((try agent_terminal_lease_transition(
         arena,
@@ -1010,7 +1028,8 @@ fn prepareDeferredDynamicCandidate(
     const validate = ctx.deps.validate_tool_call orelse return false;
     return switch (try validate(ctx.deps.ctx, alloc, call)) {
         .not_registered => false,
-        .valid, .failure => true,
+        .valid => true,
+        .failure => true,
     };
 }
 
@@ -3461,6 +3480,15 @@ fn processQueuedPromptLoop(
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
+        if (deps.take_steering) |take_steering| {
+            const guidance = try take_steering(deps.ctx, overlay_arena, turn_id);
+            for (guidance) |text| {
+                try within_turn_suffix.append(arena, .{
+                    .role = .user,
+                    .content = try runtime_execution_memory.steeringMessage(arena, text),
+                });
+            }
+        }
         if (config.explicit_skills_prompt_section.len > 0) {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
         }
@@ -5207,15 +5235,17 @@ fn processQueuedPromptLoop(
                 return;
             }
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
-            const turn: HistoryTurn = .{ .assistant = .{
+            const completed_summary = summary_accumulator.finish();
+            var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
                 .execution = finish_execution,
             } };
+            types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
             try finalization.finish(.failed, .length_limited, .{
                 .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
-                .summary = summary_accumulator.finish(),
+                .summary = completed_summary,
             });
             finish_trace.finish("provider_length");
             return;
@@ -6666,8 +6696,25 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            if (requires_legacy_classification) {
-                if (try runtime_tool_admission.registeredToolValidationFailure(deps, arena, tool_call)) |execution| {
+            var expected_mcp_runtime_generation: ?u64 = null;
+            const requires_action_validation = requires_legacy_classification or
+                tool_mcp_runtime.isAdvertisedDynamicToolName(
+                    advertised_dynamic_tool_names,
+                    tool_call.name,
+                );
+            if (requires_action_validation) {
+                const validation_failure: ?ToolExecutionResult = switch (try runtime_tool_admission.toolCallValidation(deps, arena, tool_call)) {
+                    .not_registered => null,
+                    .valid => |witness| valid: {
+                        expected_mcp_runtime_generation = witness.mcp_runtime_generation;
+                        break :valid null;
+                    },
+                    .failure => |reason| .{
+                        .model_output = reason,
+                        .status = .failure,
+                    },
+                };
+                if (validation_failure) |execution| {
                     try terminal_validation_retry.observe(
                         arena,
                         tool_call,
@@ -7498,6 +7545,7 @@ fn processQueuedPromptLoop(
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
+                .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
                     switch (preparation) {
                         .candidate => |candidate| preparedCandidateClassificationComplete(candidate),
@@ -7657,7 +7705,7 @@ fn processQueuedPromptLoop(
                 }
                 continue;
             }
-            if (execution.prepared_result_memory != null or
+            if (execution.tool_result_memory_prepared or
                 execution.deferred_tool_completion != null)
             {
                 return error.InvalidPreparedToolExecutionResult;
@@ -7674,8 +7722,6 @@ fn processQueuedPromptLoop(
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
-            } else if (execution.display_output) |display| {
-                try deps.push_text(deps.ctx, .{ .operational = display });
             }
             var replay_handed_off = execution.command_replay_capture == null;
             defer if (!replay_handed_off) {
@@ -7790,37 +7836,21 @@ fn processQueuedPromptLoop(
                 else
                     "";
                 stop_state.terminal_materializing = true;
-                if (execution.background_command) |background| {
-                    try finishCommonBackgroundTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        background,
-                        &finish_trace,
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                } else {
-                    try finishCommonAssistantTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        .completed,
-                        null,
-                        &finish_trace,
-                        "tool",
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                }
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    assistant_text,
+                    .completed,
+                    null,
+                    &finish_trace,
+                    "tool",
+                );
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
                 return;
             }
 
@@ -7940,6 +7970,26 @@ fn processQueuedPromptLoop(
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
+
+            // Close the model-response race: guidance admitted while this step
+            // was streaming converts the terminal response into an assistant
+            // prefix followed by a new user steering message.
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                if (deps.take_steering) |take_steering| {
+                    const guidance = try take_steering(deps.ctx, arena, turn_id);
+                    if (guidance.len > 0) {
+                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = rendered });
+                        for (guidance) |text| {
+                            try within_turn_suffix.append(arena, .{
+                                .role = .user,
+                                .content = try runtime_execution_memory.steeringMessage(arena, text),
+                            });
+                        }
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        continue;
+                    }
+                }
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -8108,15 +8158,17 @@ fn finishFailedTurnWithNotice(
         arena,
         current_turn_messages,
     );
-    const turn: HistoryTurn = .{ .assistant = .{
+    const completed_summary = summary_accumulator.finish();
+    var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
         .execution = execution_memory,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
     try finalization.finish(.failed, null, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
-        .summary = summary_accumulator.finish(),
+        .summary = completed_summary,
     });
     finish_trace.finish(trace_outcome);
 }
@@ -8176,47 +8228,6 @@ fn finishCommonAssistantTerminalWithExecution(
         finish_trace,
         trace_outcome,
     );
-}
-
-fn finishCommonBackgroundTerminal(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    background: command_contract.BackgroundCommand,
-    finish_trace: *PromptFinishTrace,
-) !void {
-    const execution_memory = try runtime_execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    const turn: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(assistant_text),
-        .execution = execution_memory,
-        .log_path = @constCast(background.log_path),
-        .expect_url = background.expect_url,
-        .url = if (background.url) |url| @constCast(url) else null,
-        .background_record_id = background.background_record_id,
-    } };
-    const finished = try types.dupeFinishedPrompt(
-        std.heap.c_allocator,
-        .{
-            .turn = turn,
-            .summary = summary_accumulator.finish(),
-        },
-    );
-
-    var propagation_error: ?anyerror = null;
-    deps.propagate_history_turn(deps.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
-    try finalization.finish(.completed, null, finished);
-    finish_trace.finish("background");
-    if (propagation_error) |err| return err;
 }
 
 pub fn copyLatestStopPartial(

@@ -657,6 +657,7 @@ pub fn Runtime(comptime App: type) type {
                             decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
+                            max_prompt_history,
                         )) {
                             .done => {},
                             .remapped_byte => |byte| {
@@ -1031,6 +1032,7 @@ pub fn Runtime(comptime App: type) type {
             subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
+            max_prompt_history: usize,
         ) !ResolvedEscapeRoute {
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
@@ -1199,6 +1201,7 @@ pub fn Runtime(comptime App: type) type {
                 .composer_shortcut,
                 .toggle_full_transcript,
                 => unreachable,
+                .steer_submit => try submit_rt.submitSteering(app, max_prompt_history),
                 .page_up,
                 .page_down,
                 .mouse_wheel,
@@ -1402,14 +1405,30 @@ pub fn Runtime(comptime App: type) type {
         fn approvalOwnsCurrentSurface(app: *const App) bool {
             if (!app.approval_prompt.isActive()) return false;
             if (!app.subagents.isViewActive()) return true;
+            const request = app.approval_prompt.request orelse return false;
             if (comptime !@hasDecl(@TypeOf(app.subagents), "childRouteId") or
                 !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding"))
             {
                 return true;
             }
+            const committed = if (comptime @hasField(App, "approval_screen"))
+                if (app.approval_screen.screen_commit) |commit|
+                    commit.request_id == request.id
+                else
+                    false
+            else
+                false;
+            var maybe_binding = app.subagents.mainApprovalBinding(request.id);
+            if (maybe_binding == null and committed) {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalCardBinding")) {
+                    maybe_binding = app.subagents.mainApprovalCardBinding(request.id);
+                }
+            }
+            const binding = maybe_binding orelse return false;
+            // The current card remains resolvable while its presented flag and
+            // selected child route catch up with the committed approval screen.
+            if (committed) return true;
             const child_id = app.subagents.childRouteId() orelse return false;
-            const request = app.approval_prompt.request orelse return false;
-            const binding = app.subagents.mainApprovalBinding(request.id) orelse return false;
             return std.mem.eql(u8, binding.child_id, child_id);
         }
 
@@ -1619,7 +1638,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
-                    try submit_rt.submitInput(app, max_prompt_history);
+                    try submit_rt.submit(app, max_prompt_history);
                 },
                 else => {
                     if (composer_shortcut) |action| {
@@ -2260,7 +2279,7 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             }
-            try submit_rt.submitInput(app, max_prompt_history);
+            try submit_rt.submit(app, max_prompt_history);
             return true;
         }
 
@@ -3763,8 +3782,8 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn activateFullTranscriptForRoutingTest(app: *RoutingFakeApp) void {
     app.terminal.alternate_screen_owner = .full_transcript;
-    app.terminal.alternate_mouse_tracking_active = true;
-    app.shell.full_transcript = .{ .depth = .review, .follow_tail = true };
+    app.terminal.alternate_mouse_tracking_active = false;
+    app.shell.full_transcript = .{ .depth = .full, .follow_tail = true };
 }
 
 fn appendRoutingSessionPickerSummary(
@@ -5178,6 +5197,7 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         null,
         false,
         4096,
+        100,
     );
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expectEqualStrings("$man", app.input_runtime.edit_state.input.items);
@@ -8409,6 +8429,7 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         false,
         4096,
+        100,
     );
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
 
@@ -9443,7 +9464,7 @@ test "app_input_runtime inline scroll actions do not open the transcript viewer"
     }
 }
 
-test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch detail" {
+test "app_input_runtime ctrl-o toggles full transcript while arrows preserve detail" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9460,12 +9481,12 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         app.shell.render_requests.clearReason(.modal);
         try Runtime(RoutingFakeApp).handleByte(&app, 15, 4096, 100);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
         try std.testing.expect(app.shell.full_transcript.follow_tail);
         try std.testing.expect(app.shell.render_requests.hasReason(.modal));
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9478,7 +9499,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[D");
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9489,7 +9510,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[111;5u");
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
 
         app.shell.render_requests.clearReason(.footer);
@@ -9499,7 +9520,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
         try feedRoutingBytes(&app, "\x1b[C");
@@ -9571,10 +9592,10 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006l"));
 }
 
 test "app_input_runtime skills catalog owns ctrl-o without opening another screen" {
@@ -9635,7 +9656,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
         app.shell.transcriptPresentationDepth(),
     );
 
@@ -9648,7 +9669,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 }
 
-test "app_input_runtime full transcript page and wheel keys scroll the projection" {
+test "app_input_runtime full transcript page wheel and alternate-scroll keys scroll the projection" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9670,11 +9691,16 @@ test "app_input_runtime full transcript page and wheel keys scroll the projectio
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
     try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
 
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime ctrl-o opens review and closes active transcript from each encoding" {
+test "app_input_runtime ctrl-o opens full detail and closes it from each encoding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9689,7 +9715,7 @@ test "app_input_runtime ctrl-o opens review and closes active transcript from ea
         try feedRoutingBytes(&app, "\x1b[111;5u");
 
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
     }
 
@@ -10566,6 +10592,75 @@ fn installReadyRoutingFileApproval(app: *RoutingFakeApp) !void {
     });
 }
 
+const ApprovalOwnershipBinding = struct {
+    child_id: []const u8,
+};
+
+const ApprovalOwnershipSubagents = struct {
+    view_active: bool = true,
+    child_id: []const u8 = "selected-child",
+    presented_binding: ?ApprovalOwnershipBinding = null,
+    card_binding: ?ApprovalOwnershipBinding = null,
+
+    pub fn isViewActive(self: *const ApprovalOwnershipSubagents) bool {
+        return self.view_active;
+    }
+
+    pub fn childRouteId(self: *const ApprovalOwnershipSubagents) ?[]const u8 {
+        return self.child_id;
+    }
+
+    pub fn mainApprovalBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.presented_binding;
+    }
+
+    pub fn mainApprovalCardBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.card_binding;
+    }
+};
+
+const ApprovalOwnershipApp = struct {
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    approval_screen: interaction_state.ApprovalScreenState = .{},
+    subagents: ApprovalOwnershipSubagents = .{},
+};
+
+test "committed child approval owns input while its refreshed binding catches up" {
+    const alloc = std.testing.allocator;
+    var app = ApprovalOwnershipApp{};
+    defer app.approval_prompt.deinit(alloc);
+    try std.testing.expect(try app.approval_prompt.syncRequest(
+        alloc,
+        .{ .id = 41, .label = "write external-child.txt" },
+    ));
+
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.approval_screen.recordScreenCommit(41, .{
+        .request_id = 41,
+        .rows = 24,
+        .cols = 112,
+        .file_identity_visible = true,
+        .all_decision_controls_visible = true,
+        .changed_or_notice_visible = true,
+        .document_scrollable = false,
+    });
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.subagents.card_binding = .{ .child_id = "approval-child" };
+    try std.testing.expect(
+        Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+}
+
 test "app_input_runtime consumes legacy X10 reports during active file approval" {
     const alloc = std.testing.allocator;
 
@@ -11194,6 +11289,7 @@ const FakeSubmitApp = struct {
     transcript: std.ArrayList(u8) = .empty,
     last_command: ?[]u8 = null,
     last_prompt: ?[]u8 = null,
+    last_steering: ?[]u8 = null,
     last_images: []types.ImageAttachment = &.{},
     last_skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
     notice_topic: std.ArrayList(u8) = .empty,
@@ -11232,6 +11328,7 @@ const FakeSubmitApp = struct {
         self.notice_body.deinit(self.alloc);
         if (self.last_command) |text| self.alloc.free(text);
         if (self.last_prompt) |text| self.alloc.free(text);
+        if (self.last_steering) |text| self.alloc.free(text);
         types.freeImageAttachmentSlice(self.alloc, self.last_images);
         self.clearLastSkillTokens();
         self.last_skill_tokens.deinit(self.alloc);
@@ -11321,6 +11418,14 @@ const FakeSubmitApp = struct {
 
     pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
         return self.enqueuePromptWithSkillBindings(text, &.{});
+    }
+
+    pub fn steerPrompt(self: *FakeSubmitApp, text: []const u8) !bool {
+        if (!self.queue_admitted) return false;
+        const copy = try self.alloc.dupe(u8, text);
+        if (self.last_steering) |old| self.alloc.free(old);
+        self.last_steering = copy;
+        return true;
     }
 
     pub fn enqueuePromptWithSkillBindings(
@@ -11520,6 +11625,7 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             null,
             false,
             4096,
+            100,
         );
         try std.testing.expectEqualStrings("alpha\nright\ngamma", app.input_runtime.edit_state.input.items);
         try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -11600,6 +11706,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
+        100,
     );
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
@@ -11616,6 +11723,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
+        100,
     );
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, app.input_runtime.picker.model_picker_stage);
@@ -13766,6 +13874,22 @@ test "app_input_runtime paste edit keeps the original history draft reachable" {
     try std.testing.expectEqualStrings("recalled prompt pasted edit", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(?usize, 0), app.input_runtime.composer_history.activeIndex());
     try std.testing.expectEqualStrings("unsent draft", app.input_runtime.composer_history.draftText().?);
+}
+
+test "ctrl+enter submits steering while ordinary submit keeps queue semantics" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.stream.active = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "steer now");
+    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitSteering(&app, 100);
+    try std.testing.expectEqualStrings("steer now", app.last_steering.?);
+    try std.testing.expect(app.last_prompt == null);
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "queue next");
+    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expectEqualStrings("queue next", app.last_prompt.?);
 }
 
 test "app_input_runtime small paste opens skills menu for matching dollar token" {

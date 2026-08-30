@@ -253,6 +253,15 @@ function handle(message) {
                 properties: { text: { type: "string" } },
                 required: ["text"],
               },
+              ...(mode === "tool_failure"
+                ? {
+                    outputSchema: {
+                      type: "object",
+                      properties: { result: { type: "string" } },
+                      required: ["result"],
+                    },
+                  }
+                : {}),
             }],
         ttlMs: 60_000,
         cacheScope: "public",

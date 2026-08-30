@@ -2053,13 +2053,11 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const hook");
-    var code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const code_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(code_border.style.fg.eql(.default));
     var python_row = try findRowContaining(&h, "def ready");
-    var python_cell = h.vt.cellAt(python_row, 5) orelse return error.TestMissingCodeCell;
+    var python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
     try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
     const initial_footer = try findFirstDividerRowAfter(&h, code_row);
@@ -2073,11 +2071,9 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     code_row = try findRowContaining(&h, "const hook");
-    code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const resized_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(resized_border.style.fg.eql(.default));
     python_row = try findRowContaining(&h, "def ready");
     python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
@@ -2106,18 +2102,18 @@ test "semantic code block keeps readable light theme colors through resize" {
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const value");
-    var keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 
     try h.driveResize(20, 40, 4, true);
     code_row = try findRowContaining(&h, "const value");
-    keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 }
 
-test "semantic code block drops its frame before wrapping source that fits" {
+test "semantic code block keeps solid rules while source reflows" {
     var h = try Harness.init(std.testing.allocator, 44, 40, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
@@ -2137,20 +2133,20 @@ test "semantic code block drops its frame before wrapping source that fits" {
     }
     try h.renderTranscriptFrame();
     try h.flush();
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(40, 40, 4, true);
-    try expectGridNotContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
     const first_source_row = try findRowContaining(&h, "┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row, "      ┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row + 1, "      │ ROOT                           │");
     try expectRowTrimmedEquals(&h, first_source_row + 2, "      └────────────────────────────────┘");
 
     try h.driveResize(39, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(44, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 }
 
 test "streamed paragraphs keep words together through shrink and grow" {
@@ -3770,7 +3766,7 @@ test "completed replay tool entries fit a constrained terminal" {
     try expectGridContains(&h, "TOOL_REPLAY_FINISHED");
     try std.testing.expect(h.shell.last_visible_transcript_last_row <= h.shell.layout.rows);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -3971,7 +3967,7 @@ test "approval banner keeps one blank row after bottom assistant line" {
     }
     try body.appendSlice(h.alloc, "final assistant tail");
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, body.items);
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4002,7 +3998,7 @@ test "approval banner frames prompt after completed tool status" {
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, body.items, .subagent_status);
     _ = try appendCompletedToolStatus(&h, "Listed project");
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4306,7 +4302,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4377,7 +4373,7 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4499,7 +4495,7 @@ test "long context notice survives full transcript growth and later compact resi
     try expectGridContains(&h, "compact marker");
     try expectGridNotContains(&h, "xxxxxxxx");
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4591,7 +4587,7 @@ test "folded command output survives canonical resize repaint" {
         true,
     );
     try std.testing.expect(
-        try h.shell.setTranscriptPresentationDepth(alloc, .review),
+        try h.shell.setTranscriptPresentationDepth(alloc, .full),
     );
     try h.shell.writeTranscript(
         alloc,

@@ -596,17 +596,9 @@ pub fn Runtime(comptime App: type) type {
             if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return status_changed;
             }
-            const native_history_active = if (comptime @hasDecl(
-                @TypeOf(app.shell),
-                "nativeHistoryActive",
-            ))
-                app.shell.nativeHistoryActive()
-            else
-                false;
             if (app.approval_prompt.isActive() or
                 app.question_prompt.isActive() or
-                !app.shell.shimmer_active or
-                native_history_active)
+                !app.shell.shimmer_active)
             {
                 return status_changed;
             }
@@ -2194,7 +2186,7 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
 }
 
-test "core.app_worker_runtime pauses visible animation after native history starts" {
+test "core.app_worker_runtime keeps visible animation alive after native history starts" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -2207,13 +2199,13 @@ test "core.app_worker_runtime pauses visible animation after native history star
     app.shell.render_requests.animation_visible = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
         &app,
         NoopBridge.lifecyclePresenter(&app),
         1,
         test_awake_timestamp(1),
     ));
-    try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 }
 
 test "core.app_worker_runtime refreshes root and selected child retry countdowns" {

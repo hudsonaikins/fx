@@ -2759,7 +2759,16 @@ test "core session detail JSON includes assistant execution memory" {
     const history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("fetch pdf") },
         .assistant = @constCast("artifact saved"),
-        .execution = .{ .tool_steps = steps[0..] },
+        .execution = .{
+            .tool_steps = steps[0..],
+            .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .thinking_duration_ms = 40,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            },
+        },
     } }};
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
@@ -2792,11 +2801,17 @@ test "core session detail JSON includes assistant execution memory" {
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"turn_summary\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_fetch\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "artifact-file.pdf") != null);
     try std.testing.expect(std.mem.find(u8, json, "command_output_replay") == null);
     try std.testing.expect(std.mem.find(u8, json, "command_process_presentation") == null);
     try std.testing.expect(std.mem.find(u8, json, "fx-command-replay-private-sentinel.bin") == null);
+
+    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "started_at_ms") == null);
+    try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);
 }
 
 test "core session migration snapshot text and json stay stable" {

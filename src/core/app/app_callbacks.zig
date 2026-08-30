@@ -279,15 +279,12 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
-                .current_mcp_generation = if (comptime @hasDecl(App, "acquireMcpRuntime"))
-                    agentCurrentMcpGeneration
-                else
-                    null,
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
+                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
                 .prepare_parent_turn_context = agentPrepareParentTurnContext,
                 .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
                 .append_runtime_context = agentAppendRuntimeContext,
@@ -368,13 +365,6 @@ pub fn Bindings(comptime App: type) type {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
             return deps;
-        }
-
-        fn agentCurrentMcpGeneration(raw_ctx: *anyopaque) ?u64 {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var lease = app.acquireMcpRuntime() orelse return null;
-            defer lease.deinit();
-            return lease.runtime.generation;
         }
 
         fn agentReleaseTerminalLease(ctx: *anyopaque, session_id: []const u8) !void {
@@ -572,6 +562,19 @@ pub fn Bindings(comptime App: type) type {
                 .turn_id = turn_id,
                 .outcome = outcome,
             });
+        }
+
+        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            if (owned.len == 0) return &.{};
+            defer {
+                for (owned) |text| std.heap.c_allocator.free(text);
+                std.heap.c_allocator.free(owned);
+            }
+            const result = try arena.alloc([]const u8, owned.len);
+            for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
+            return result;
         }
 
         fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
