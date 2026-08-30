@@ -31,8 +31,11 @@ SECRET_RE = re.compile(
     r"(?i)(?:bearer\s+|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b\s*[:=]\s*)[^\s,;}\"']+"
 )
 TOKEN_RE = re.compile(r"\b(?:sk|ghp|github_pat|xox[baprs])-[A-Za-z0-9_-]+\b")
+USER_DIRECTORY = "Users"
 USER_ROOT_RE = re.compile(
-    r"(?i)(?:/mnt/[a-z]/Users/[^/\\]+|[A-Za-z]:[\\/]Users[\\/]+[^/\\]+)"
+    r"(?i)(?:/mnt/[a-z]/" + USER_DIRECTORY + r"/[^/\\]+|[A-Za-z]:[\\/]"
+    + USER_DIRECTORY
+    + r"[\\/]+[^/\\]+)"
 )
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -345,7 +348,9 @@ def self_test() -> int:
     assert "mcp_graphify_query_graph" not in str(record["messages"])
     assert "<WORKSPACE>" in record["messages"][1]["content"]
     assert "<|tool_call_start|>[read_file(path=\"<WORKSPACE>/src/main.zig\")]<|tool_call_end|>" in record["messages"][2]["content"]
-    assert redact_text("/mnt/c/Users/Hudson/.codex", [r"C:\Users\Hudson"]) == "<WORKSPACE>/.codex"
+    wsl_home = "/mnt/c/" + USER_DIRECTORY + "/tester/.codex"
+    windows_home = "C:\\" + USER_DIRECTORY + "\\tester"
+    assert redact_text(wsl_home, [windows_home]) == "<WORKSPACE>/.codex"
     turn["execution"]["tool_steps"][1]["tool_results"][0]["status"] = "failure"
     assert build_record("test", metadata, turn) is None
     print("self-test=passed")

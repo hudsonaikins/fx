@@ -35,11 +35,7 @@ def default_dataset_path() -> Path:
     if configured:
         return Path(configured).expanduser()
 
-    candidates = (
-        Path("/mnt/c/Users/Hudson/.cache/fx-lfm-trajectories.jsonl"),
-        Path.home() / ".cache" / "fx-lfm-trajectories.jsonl",
-    )
-    return next((path for path in candidates if path.exists()), candidates[0])
+    return Path.home() / ".cache" / "fx-lfm-trajectories.jsonl"
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
