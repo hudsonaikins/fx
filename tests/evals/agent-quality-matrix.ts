@@ -310,7 +310,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "ask-user misuse",
     expectedFirstTool: {
       category: "local concept discovery",
-      tools: ["semantic_search", "glob_files", "grep_files", "read_file"],
+      tools: LOCAL_FILE_TOOLS,
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:

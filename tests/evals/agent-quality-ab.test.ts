@@ -3,6 +3,7 @@ import {
   DEFAULT_AB_ROW_IDS,
   classifyObservedDelta,
   createTrialOrder,
+  duplicateToolLoops,
   loadAbConfigFromEnv,
   redactSensitiveValue,
   requireAbsoluteExecutableBinary,
@@ -107,6 +108,51 @@ describe("agent quality A/B harness helpers", () => {
     expect(score.passed).toBe(false);
     expect(score.forbiddenTools).toEqual(["web_search"]);
     expect(score.reason).toContain("first tool");
+  });
+
+  test("fails repeated identical tool calls as a duplicate loop", () => {
+    expect(duplicateToolLoops([
+      { name: "read_file" },
+      { name: "read_file" },
+      { name: "read_file" },
+    ])).toEqual(["read_file x3"]);
+
+    const row = matrixRowById("slash-command-definition-search");
+    const score = scoreAbTrial(row!, {
+      exit_code: 0,
+      model: "provider/test-model",
+      output: "src/core/slash_commands/command_specs.zig",
+      session_id: "",
+      steps: 3,
+      tool_calls: [
+        { name: "grep_files", status: "success" },
+        { name: "grep_files", status: "success" },
+        { name: "grep_files", status: "success" },
+      ],
+    });
+
+    expect(score.passed).toBe(false);
+    expect(score.duplicateToolLoops).toEqual(["grep_files x3"]);
+  });
+
+  test("scores the first local tool after required Graphify preflight", () => {
+    const row = matrixRowById("unfamiliar-feature-inspect-before-question");
+    const score = scoreAbTrial(row!, {
+      exit_code: 0,
+      model: "provider/test-model",
+      output: "MCP is configured through Graphify retrieval.",
+      session_id: "",
+      steps: 4,
+      tool_calls: [
+        { name: "capability_search", status: "success" },
+        { name: "mcp_select_tool", status: "success" },
+        { name: "mcp_graphify_query_graph", status: "success" },
+        { name: "read_file", status: "success" },
+      ],
+    });
+
+    expect(score.passed).toBe(true);
+    expect(score.firstTool).toBe("capability_search");
   });
 
   test("classifies paired trial deltas without deterministic single-run claims", () => {

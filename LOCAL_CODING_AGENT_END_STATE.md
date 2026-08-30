@@ -2,13 +2,14 @@
 
 Status: target contract
 Owner: FX local-model work
-Date: 2026-08-29
+Date: 2026-08-30
 
 ## Current Checkpoint
 
 - Corpus: 100 records, combining 44 curated execution examples with 56 exported healthy FX sessions.
 - Candidate: one local Unsloth QLoRA epoch, exported as Q8 GGUF, trained on an 80-record split with 20 records held out by the trainer.
 - A/B snapshot: v1 completed 7 of 8 probes; the new candidate completed 2 of 8. Candidate rejected and left inactive.
+- Latest local A/B diagnostic: one trial, three rows, six max agent steps, and 60-second side timeout produced v1 0/3 versus stock Q8 0/3. v1 side latencies were 7.4 to 10.0 seconds; Q8 side latencies were 58.6 to 71.9 seconds, including two timed-out JSON runs. A separate slash-command probe produced v1 0/1 versus QLoRA v2 0/1; v2 emitted literal `</tool_call>` text without structured tool calls. Diagnostic only, not a promotion gate.
 - Active rollback model: `lfm-fx-execution-v1` at 128,000 context.
 - Permission gate: local `--auto` review now routes through LM Studio and returned `review_caution` for a held action; PTY interactive approval and denial both verified. The smoke ended at the agent-step limit after denied follow-up variants, so process-completion quality remains unproven.
 - Decision: stop model tuning here. Keep v1 active; finish focused real-task evaluation, CI, and pilot gates before promotion.
