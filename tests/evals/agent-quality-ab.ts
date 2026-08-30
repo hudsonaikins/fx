@@ -79,6 +79,8 @@ export interface AbConfig {
   candidateModel: string;
   provider: AbProvider;
   localChatUrl?: string;
+  baselineLocalChatUrl?: string;
+  candidateLocalChatUrl?: string;
   localAllowNonLoopback: boolean;
   mcpConfigPath?: string;
   maxAgentSteps: number;
@@ -166,6 +168,7 @@ export function loadAbConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AbCon
   const outputDir =
     env.FX_AB_OUTPUT_DIR ??
     mkdtempSync(join(tmpdir(), `fx-agent-quality-ab-${Date.now()}-`));
+  const localChatUrl = env.FX_AB_LOCAL_CHAT_URL ?? env.FX_LOCAL_CHAT_URL;
 
   return {
     baselineBin,
@@ -174,7 +177,9 @@ export function loadAbConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AbCon
     baselineModel,
     candidateModel,
     provider,
-    localChatUrl: env.FX_AB_LOCAL_CHAT_URL ?? env.FX_LOCAL_CHAT_URL,
+    localChatUrl,
+    baselineLocalChatUrl: env.FX_AB_BASELINE_LOCAL_CHAT_URL ?? localChatUrl,
+    candidateLocalChatUrl: env.FX_AB_CANDIDATE_LOCAL_CHAT_URL ?? localChatUrl,
     localAllowNonLoopback: env.FX_AB_LOCAL_ALLOW_NON_LOOPBACK === "1",
     mcpConfigPath: env.FX_AB_MCP_CONFIG,
     maxAgentSteps,
@@ -438,7 +443,9 @@ export async function runAbTrial(
     NO_COLOR: "1",
     FX_MODEL: config.provider === "gateway" ? model : undefined,
     FX_LOCAL_MODEL: config.provider === "local" ? model : undefined,
-    FX_LOCAL_CHAT_URL: config.provider === "local" ? config.localChatUrl : undefined,
+    FX_LOCAL_CHAT_URL: config.provider === "local"
+      ? side === "baseline" ? config.baselineLocalChatUrl : config.candidateLocalChatUrl
+      : undefined,
     FX_LOCAL_ALLOW_NON_LOOPBACK:
       config.provider === "local" && config.localAllowNonLoopback ? "1" : undefined,
     FX_MAX_AGENT_STEPS: String(config.maxAgentSteps),
@@ -583,6 +590,8 @@ export async function runAbComparison(config = loadAbConfigFromEnv()): Promise<v
     candidateModel: config.candidateModel,
     provider: config.provider,
     localChatUrl: config.localChatUrl,
+    baselineLocalChatUrl: config.baselineLocalChatUrl,
+    candidateLocalChatUrl: config.candidateLocalChatUrl,
     localAllowNonLoopback: config.localAllowNonLoopback,
     maxAgentSteps: config.maxAgentSteps,
     rowIds: config.rowIds,

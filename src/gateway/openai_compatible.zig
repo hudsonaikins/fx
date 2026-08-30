@@ -4,6 +4,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const responses_protocol = @import("responses_protocol.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,7 @@ const max_sse_events: usize = 100_000;
 const max_tool_calls: usize = 128;
 const max_tool_identity_bytes: usize = 1024;
 const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
+const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
 
@@ -138,6 +140,31 @@ fn writeMessage(writer: *std.Io.Writer, message: types.ChatMessage) !void {
     try writer.writeByte('}');
 }
 
+fn writeMessages(writer: *std.Io.Writer, alloc: Allocator, messages: []const types.ChatMessage) !void {
+    var merged_system: std.ArrayList(u8) = .empty;
+    defer merged_system.deinit(alloc);
+
+    var system_count: usize = 0;
+    for (messages) |message| {
+        if (message.role != .system) continue;
+        if (system_count > 0) try merged_system.appendSlice(alloc, "\n\n");
+        if (message.content) |content| try merged_system.appendSlice(alloc, content);
+        system_count += 1;
+    }
+
+    var wrote_message = false;
+    if (system_count > 0) {
+        try writeMessage(writer, .{ .role = .system, .content = merged_system.items });
+        wrote_message = true;
+    }
+    for (messages) |message| {
+        if (message.role == .system) continue;
+        if (wrote_message) try writer.writeByte(',');
+        try writeMessage(writer, message);
+        wrote_message = true;
+    }
+}
+
 pub fn buildRequest(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
     try validateModel(request.model);
     try validateImages(request);
@@ -150,11 +177,10 @@ pub fn buildRequest(alloc: Allocator, request: stream_provider.RequestData) ![]u
     try out.writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, &out.writer);
     try out.writer.writeAll(",\"messages\":[");
-    for (request.messages, 0..) |message, index| {
+    for (request.messages) |message| {
         if (message.images.len > 0) return error.LocalProviderVisionUnsupported;
-        if (index > 0) try out.writer.writeByte(',');
-        try writeMessage(&out.writer, message);
     }
+    try writeMessages(&out.writer, alloc, request.messages);
     try out.writer.writeAll("],\"stream\":true,\"tools\":");
     const tool_count = try writeTools(&out.writer, alloc, request.tools);
     try out.writer.writeAll(",\"tool_choice\":");
@@ -176,6 +202,69 @@ pub fn buildRequest(alloc: Allocator, request: stream_provider.RequestData) ![]u
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     }
     return try out.toOwnedSlice();
+}
+
+fn isResponsesUrl(url: []const u8) bool {
+    return std.mem.endsWith(u8, url, "/responses");
+}
+
+fn buildResponsesRequest(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
+    try validateModel(request.model);
+    try validateImages(request);
+    if (request.budget) |budget| {
+        if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    }
+
+    var instructions: std.Io.Writer.Allocating = .init(alloc);
+    defer instructions.deinit();
+    for (request.messages) |message| {
+        if (message.role != .system) continue;
+        const content = message.content orelse continue;
+        if (content.len == 0) continue;
+        if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
+        try instructions.writer.writeAll(content);
+    }
+    if (instructions.written().len == 0) try instructions.writer.writeAll("You are a helpful assistant.");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"model\":");
+    try std.json.Stringify.value(request.model, .{}, &out.writer);
+    try out.writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try std.json.Stringify.value(instructions.written(), .{}, &out.writer);
+    try out.writer.writeAll(",\"input\":[");
+    try responses_protocol.writeInput(&out.writer, alloc, request.messages, null, .{
+        .tool_calls = max_tool_calls,
+        .tool_identity_bytes = max_tool_identity_bytes,
+        .tool_arguments_bytes = max_tool_arguments_bytes,
+        .provider_state_bytes = max_provider_state_bytes,
+    });
+    try out.writer.writeByte(']');
+    _ = try responses_protocol.writeTools(&out.writer, alloc, request.tools);
+    try out.writer.writeAll(",\"tool_choice\":");
+    try std.json.Stringify.value(request.tool_choice.label(), .{}, &out.writer);
+    try out.writer.writeAll(",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"none\"}");
+    if (request.response_format) |format| {
+        if (format.schema != .object) return error.InvalidStructuredResponseSchema;
+        try out.writer.writeAll(",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":");
+        try std.json.Stringify.value(format.name, .{}, &out.writer);
+        try out.writer.writeAll(",\"description\":");
+        try std.json.Stringify.value(format.description, .{}, &out.writer);
+        try out.writer.writeAll(",\"schema\":");
+        try std.json.Stringify.value(format.schema, .{}, &out.writer);
+        try out.writer.writeAll(",\"strict\":true}}");
+    }
+    if (request.max_output_tokens) |limit| try out.writer.print(",\"max_output_tokens\":{d}", .{limit});
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+pub fn buildLocalRequest(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
+    const url = io_mod.getenv(chat_url_env) orelse default_chat_url;
+    return if (isResponsesUrl(url))
+        buildResponsesRequest(alloc, request)
+    else
+        buildRequest(alloc, request);
 }
 
 const ToolAccumulator = struct {
@@ -1045,6 +1134,67 @@ fn consumeSse(
     return reducer.finish(alloc);
 }
 
+const ResponsesEventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn consumeResponsesSse(
+    alloc: Allocator,
+    reader: anytype,
+    request: stream_provider.ModelRequest,
+) !types.ModelCompletion {
+    var reducer = responses_protocol.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var sse: SseReader = .{};
+    defer sse.deinit(alloc);
+    var events = request.events;
+    const callbacks = responses_protocol.StreamCallbacks{
+        .context = &events,
+        .on_content = ResponsesEventBridge.content,
+        .on_tool_start = ResponsesEventBridge.toolStart,
+        .on_reasoning = ResponsesEventBridge.reasoning,
+        .on_tool_input = ResponsesEventBridge.toolInput,
+    };
+    const stream_limits = responses_protocol.StreamLimits{
+        .aggregate_bytes = max_sse_aggregate_bytes,
+        .events = max_sse_events,
+        .tool_calls = max_tool_calls,
+        .tool_identity_bytes = max_tool_identity_bytes,
+        .tool_arguments_bytes = max_tool_arguments_bytes,
+        .provider_state_bytes = max_provider_state_bytes,
+    };
+    while (try sse.next(alloc, reader)) |json_text| {
+        defer sse.release();
+        if (try reducer.applyJson(
+            alloc,
+            json_text,
+            callbacks,
+            request.cancel_flag,
+            request.content_capture_limit,
+            stream_limits,
+        )) break;
+    }
+    return reducer.finish(alloc, request.cancel_flag, stream_limits);
+}
+
 fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     return switch (status) {
         .bad_request => .invalid_request,
@@ -1103,7 +1253,7 @@ fn streamCompletion(
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
+    const payload = try buildLocalRequest(alloc, request.data());
     defer alloc.free(payload);
     var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -1225,7 +1375,10 @@ pub fn streamPrepared(
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    const completion = try consumeSse(alloc, reader, request);
+    const completion = if (isResponsesUrl(chat_url))
+        try consumeResponsesSse(alloc, reader, request)
+    else
+        try consumeSse(alloc, reader, request);
     return .{ .completed = .{
         .completion = completion,
         .usage = .{ .unavailable = .unbilled },
@@ -1252,6 +1405,60 @@ test "local OpenAI-compatible request uses Chat Completions tool schema" {
     try std.testing.expect(std.mem.find(u8, body, "\"chat.completions\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"tools\":[{\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\"") != null);
+}
+
+test "local OpenAI-compatible request coalesces system messages at the front" {
+    const calls = [_]types.ToolCall{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "base rules" },
+        .{ .role = .user, .content = "Inspect the repository." },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
+        .{ .role = .system, .content = "review this exact action" },
+    };
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "qwen35-4b-128k",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const first_system = std.mem.indexOf(u8, body, "\"role\":\"system\"") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, body[first_system + 1 ..], "\"role\":\"system\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"base rules\\n\\nreview this exact action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\",\"content\":\"base rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\",\"content\":\"Inspect the repository.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\",\"tool_call_id\":\"call_1\"") != null);
+}
+
+test "local Responses request uses LM Studio reasoning and tool schema" {
+    const function = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read file",
+        .input_schema = .{},
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Use local tools." },
+        .{ .role = .user, .content = "Read it." },
+    };
+    const body = try buildResponsesRequest(std.testing.allocator, .{
+        .model = "qwen35-4b-128k",
+        .messages = &messages,
+        .tools = .{ .additional_functions = &.{function} },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"Use local tools.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":{\"verbosity\":\"low\"") == null);
 }
 
 test "local OpenAI-compatible request rejects images" {

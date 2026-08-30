@@ -22,7 +22,7 @@ fn reviewLocal(
         .model = request.review_turn.model,
         .require_credential = false,
         .validate_fn = validateLocal,
-        .build_fn = openai_compatible.buildRequest,
+        .build_fn = openai_compatible.buildLocalRequest,
         .send_fn = sendPrepared,
     });
 }

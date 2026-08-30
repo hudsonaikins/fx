@@ -10,6 +10,7 @@ Date: 2026-08-30
 - Candidate: one local Unsloth QLoRA epoch, exported as Q8 GGUF, trained on an 80-record split with 20 records held out by the trainer.
 - A/B snapshot: v1 completed 7 of 8 probes; the new candidate completed 2 of 8. Candidate rejected and left inactive.
 - Latest local A/B diagnostic: one trial, three rows, six max agent steps, and 60-second side timeout produced v1 0/3 versus stock Q8 0/3. v1 side latencies were 7.4 to 10.0 seconds; Q8 side latencies were 58.6 to 71.9 seconds, including two timed-out JSON runs. A separate slash-command probe produced v1 0/1 versus QLoRA v2 0/1; v2 emitted literal `</tool_call>` text without structured tool calls. Diagnostic only, not a promotion gate.
+- Qwen transport and model probe: Qwen3.5-4B Q4 at 128K through LM Studio Responses API completed 7/15 matrix trials versus Liquid v1 at 10/15 through Chat Completions. Qwen improved two rows and regressed three; raw-run median end-to-end latency was 16,622 ms versus Liquid at 10,986 ms. Qwen remains inactive; this result does not pass promotion gates.
 - Active rollback model: `lfm-fx-execution-v1` at 128,000 context.
 - Permission gate: local `--auto` review now routes through LM Studio and returned `review_caution` for a held action; PTY interactive approval and denial both verified. The smoke ended at the agent-step limit after denied follow-up variants, so process-completion quality remains unproven.
 - Decision: stop model tuning here. Keep v1 active; finish focused real-task evaluation, CI, and pilot gates before promotion.
@@ -34,6 +35,7 @@ This is not a replacement for frontier hosted coding agents. It should handle re
 - Skills: Caveman and Ponytail loaded for local coding requests.
 - Tool flow: Graphify preflight, narrow local tool projection, exact tool arguments, permissioned execution, result verification.
 - Runtime: FX local provider through the OpenAI-compatible LM Studio endpoint.
+- Transport compatibility: Chat Completions remains Liquid's default path. FX selects LM Studio Responses when `FX_LOCAL_CHAT_URL` ends with `/responses`, merges system messages into the required leading position, disables Qwen reasoning for tool execution, and reuses the existing Responses tool-call reducer.
 - Baseline: `lfm-fx-execution-v1` remains rollback target. Experimental candidates stay inactive until they pass A/B gates.
 
 ## Definition Of Complete
@@ -103,3 +105,6 @@ After step 7, only bug fixes, security fixes, dependency updates, and changes ju
 - [PEFT quantization guide](https://huggingface.co/docs/peft/developer_guides/quantization): quantized bases are normally adapted with PEFT; QLoRA uses a 4-bit base with trainable LoRA adapters.
 - [Unsloth LM Studio deployment](https://unsloth.ai/docs/basics/inference-and-deployment/lm-studio): export the fine-tuned model to GGUF for local LM Studio deployment.
 - [FX MCP documentation](https://fx.sh/docs/capabilities/mcp): MCP provides the capability discovery and tool integration boundary used by FX.
+- [Qwen3.5-4B model card](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/README.md): Qwen defaults to thinking mode and documents non-thinking and tool-serving configuration.
+- [Qwen3.5 chat template](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/chat_template.jinja): system messages must precede user, assistant, and tool messages.
+- [LM Studio Responses API](https://lmstudio.ai/docs/developer/openai-compat/responses): local Responses transport supports streaming, reasoning controls, and custom tools.
