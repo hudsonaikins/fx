@@ -294,7 +294,7 @@ describe("fx ask presentation", () => {
     };
     const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
     expect(terminalTool?.description).toBe(
-      "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
+      "Run one captured command with a required finite timeout_ms and return its result. When the user gives a command, preserve it exactly; do not invent a replacement command or path. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
     );
     const terminalSchema = terminalTool?.inputSchema;
     expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);

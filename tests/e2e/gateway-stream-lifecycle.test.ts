@@ -741,7 +741,7 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "terminal")?.description).toBe(
-        "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
+        "Run one captured command with a required finite timeout_ms and return its result. When the user gives a command, preserve it exactly; do not invent a replacement command or path. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
