@@ -314,7 +314,7 @@ describe("fx ask presentation", () => {
     ]);
     expect(terminalSchema?.additionalProperties).toBe(false);
     expect(terminalSchema?.properties?.command?.description).toBe(
-      "Command to run. Set null when the selected action does not use this field.",
+      "Exact command requested by the user. Do not substitute or invent commands. Set null when the selected action does not use this field.",
     );
     expect(terminalSchema?.properties?.cwd?.description).toBe(
       "Working directory; defaults to the workspace. Set null when the selected action does not use this field.",
