@@ -303,17 +303,26 @@ function sideModel(config: AbConfig, side: AbSide): string {
   return side === "baseline" ? config.baselineModel : config.candidateModel;
 }
 
-function translateMcpConfigPaths(value: unknown): unknown {
+function translateMcpConfigPaths(value: unknown, key?: string): unknown {
   if (typeof value === "string") {
     const match = /^([A-Za-z]):[\\/](.*)$/.exec(value);
-    return process.platform === "linux" && match
+    return process.platform === "linux" && key === "command" && match
       ? `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll("\\", "/")}`
       : value;
   }
-  if (Array.isArray(value)) return value.map(translateMcpConfigPaths);
+  if (Array.isArray(value)) {
+    return key === "command"
+      ? value.map((entry, index) =>
+          index === 0 ? translateMcpConfigPaths(entry, key) : entry,
+        )
+      : value.map((entry) => translateMcpConfigPaths(entry));
+  }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, translateMcpConfigPaths(entry)]),
+      Object.entries(value).map(([entryKey, entry]) => [
+        entryKey,
+        translateMcpConfigPaths(entry, entryKey),
+      ]),
     );
   }
   return value;
