@@ -27,10 +27,47 @@ ERROR_MARKERS = (
     "graph.json not found",
     "Error executing query_graph",
 )
-SECRET_RE = re.compile(
-    r"(?i)(?:bearer\s+|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b\s*[:=]\s*)[^\s,;}\"']+"
+SECRET_KEY_PATTERN = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|"
+    r"password|passwd|secret(?:[_-]?key)?|client[_-]?secret|"
+    r"authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|"
+    r"github[_-]?token|hf[_-]?token|token|credential|credentials)"
 )
-TOKEN_RE = re.compile(r"\b(?:sk|ghp|github_pat|xox[baprs])-[A-Za-z0-9_-]+\b")
+SECRET_RE = re.compile(
+    r"(?ix)"
+    r"(?:"
+    r"\b(?:authorization|proxy[_-]?authorization)\b\s*[\"']?\s*:\s*[\"']?(?:bearer|token)\s+"
+    r"|\bbearer\s+"
+    r"|\b" + SECRET_KEY_PATTERN + r"\b\s*[\"']?\s*[:=]\s*[\"']?"
+    r")[^\s,;}\"']+"
+)
+TOKEN_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]+|(?:ghp|gho|ghs|ghr)[_-][A-Za-z0-9_-]+|"
+    r"github_pat[_-][A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9_-]+|"
+    r"hf_[A-Za-z0-9_-]+)\b"
+)
+SENSITIVE_KEY_NAMES = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "password",
+        "passwd",
+        "secret",
+        "secretkey",
+        "clientsecret",
+        "authorization",
+        "proxyauthorization",
+        "cookie",
+        "setcookie",
+        "token",
+        "credential",
+        "credentials",
+        "githubtoken",
+        "hftoken",
+    }
+)
 USER_DIRECTORY = "Users"
 USER_ROOT_RE = re.compile(
     r"(?i)(?:/mnt/[a-z]/" + USER_DIRECTORY + r"/[^/\\]+|[A-Za-z]:[\\/]"
@@ -65,13 +102,23 @@ def redact_text(value: str, roots: list[str]) -> str:
     return TOKEN_RE.sub("<REDACTED>", output)
 
 
+def is_sensitive_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in SENSITIVE_KEY_NAMES
+
+
 def redact_value(value: Any, roots: list[str]) -> Any:
     if isinstance(value, str):
         return redact_text(value, roots)
     if isinstance(value, list):
         return [redact_value(item, roots) for item in value]
     if isinstance(value, dict):
-        return {key: redact_value(item, roots) for key, item in value.items()}
+        return {
+            key: "<REDACTED>" if is_sensitive_key(key) else redact_value(item, roots)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -225,6 +272,7 @@ def build_record(
             "tool_count": tool_count,
             "tool_names": sorted(tool_names),
             "format": "lfm2.5-native-tool-calls",
+            "redaction_version": 2,
         },
     }
     digest = hashlib.sha256(
@@ -351,6 +399,22 @@ def self_test() -> int:
     wsl_home = "/mnt/c/" + USER_DIRECTORY + "/tester/.codex"
     windows_home = "C:\\" + USER_DIRECTORY + "\\tester"
     assert redact_text(wsl_home, [windows_home]) == "<WORKSPACE>/.codex"
+    redacted = redact_text(
+        "Authorization: token gho_abcdefghijklmnopqrstuvwxyz "
+        "github_pat_11AAAA_secret token=plain-secret api_key=plain-api-key",
+        [],
+    )
+    assert "gho_" not in redacted
+    assert "github_pat_" not in redacted
+    assert "plain-secret" not in redacted
+    assert "plain-api-key" not in redacted
+    structured = redact_value(
+        {"token": "structured-secret", "token_count": 128, "authorization_docs": "public"},
+        [],
+    )
+    assert structured["token"] == "<REDACTED>"
+    assert structured["token_count"] == 128
+    assert structured["authorization_docs"] == "public"
     turn["execution"]["tool_steps"][1]["tool_results"][0]["status"] = "failure"
     assert build_record("test", metadata, turn) is None
     print("self-test=passed")

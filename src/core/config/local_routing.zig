@@ -7,6 +7,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const Allocator = std.mem.Allocator;
 
 pub const graphify_query_tool = "mcp_graphify_query_graph";
+const graphify_query_alias = "graphify_query_graph";
 
 pub const guidance =
     "<local_repository_routing>\n" ++
@@ -120,6 +121,37 @@ const read_only_directives = [_][]const u8{
     "don't change",
 };
 
+const negative_execution_directives = [_][]const u8{
+    "do not run",
+    "don't run",
+    "never run",
+    "without running",
+    "do not execute",
+    "don't execute",
+    "never execute",
+    "without executing",
+    "do not test",
+    "don't test",
+    "never test",
+    "without testing",
+    "do not build",
+    "don't build",
+    "never build",
+    "without building",
+    "do not format",
+    "don't format",
+    "do not lint",
+    "don't lint",
+    "do not compile",
+    "don't compile",
+    "do not check",
+    "don't check",
+    "do not use terminal",
+    "don't use terminal",
+    "never use terminal",
+    "without terminal",
+};
+
 const terminal_request_markers = [_][]const u8{
     "run",
     "execute",
@@ -174,7 +206,8 @@ pub fn requiresGraphify(provider: model_provider.ProviderId, prompt: []const u8)
 }
 
 pub fn isGraphifyRetrievalTool(name: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(name, "graphify") != null;
+    return std.mem.eql(u8, name, graphify_query_tool) or
+        std.mem.eql(u8, name, graphify_query_alias);
 }
 
 pub fn repairGraphifyRoutingCall(
@@ -316,6 +349,9 @@ pub fn isTerminalOnlyRequest(prompt: []const u8) bool {
         }
     }
     if (!has_execution_marker) return false;
+    for (negative_execution_directives) |directive| {
+        if (std.ascii.indexOfIgnoreCase(prompt, directive) != null) return false;
+    }
     for (read_only_directives) |directive| {
         if (std.ascii.indexOfIgnoreCase(prompt, directive) != null) return true;
     }
@@ -538,6 +574,10 @@ test "local repository routing gates inspection and loads coding skills" {
     try std.testing.expect(!requiresGraphify(.local, "What is the weather?"));
     try std.testing.expect(!requiresGraphify(.local, "Show profile settings."));
     try std.testing.expect(!requiresGraphify(.gateway, "Inspect this repository."));
+    try std.testing.expect(isGraphifyRetrievalTool(graphify_query_tool));
+    try std.testing.expect(isGraphifyRetrievalTool("graphify_query_graph"));
+    try std.testing.expect(!isGraphifyRetrievalTool("mcp_graphify_delete_graph"));
+    try std.testing.expect(!isGraphifyRetrievalTool("graphify_status"));
 
     const no_messages = [_]types.ChatMessage{};
     try std.testing.expect(blocksBeforeGraphify(.local, "Fix this code", &no_messages, "read_file"));
@@ -551,6 +591,8 @@ test "local repository routing gates inspection and loads coding skills" {
     try std.testing.expect(!isReadOnlyInspection("Run the focused tests."));
     try std.testing.expect(isTerminalOnlyRequest("Run the focused tests."));
     try std.testing.expect(isTerminalOnlyRequest("Run the focused tests. Do not edit files."));
+    try std.testing.expect(!isTerminalOnlyRequest("Do not run exactly `rm -rf /tmp/x`; explain what it would do."));
+    try std.testing.expect(!isTerminalOnlyRequest("Do not execute the command; explain it."));
     try std.testing.expect(!isTerminalOnlyRequest("Run tests and fix failures."));
     try std.testing.expect(isReadOnlyLocalInspectionTool("read_file"));
     try std.testing.expect(isReadOnlyLocalInspectionTool("file_info"));

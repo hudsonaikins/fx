@@ -1356,20 +1356,28 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, self.provider_selection.selection().model);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
+        const provider = self.provider_selection.selection().provider;
+        const gateway_credential = if (provider == .local)
+            null
+        else
+            self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key_copy = try std.heap.c_allocator.dupe(u8, if (gateway_credential) |credential| credential.api_key else "");
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
-        const gateway_team_copy = if (gateway_credential.gateway_team) |team|
-            try std.heap.c_allocator.dupe(u8, team)
+        const gateway_team_copy = if (gateway_credential) |credential|
+            if (credential.gateway_team) |team|
+                try std.heap.c_allocator.dupe(u8, team)
+            else
+                null
         else
             null;
         errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
-        const account_id_copy = if (self.auth.accountId()) |account_id|
-            try std.heap.c_allocator.dupe(u8, account_id)
+        const account_id = if (gateway_credential != null) self.auth.accountId() else null;
+        const account_id_copy = if (account_id) |value|
+            try std.heap.c_allocator.dupe(u8, value)
         else
             null;
-        errdefer if (account_id_copy) |account_id| std.heap.c_allocator.free(account_id);
+        errdefer if (account_id_copy) |value| std.heap.c_allocator.free(value);
 
         const authorized_image_catalog = try self.session.snapshotImageCatalog(
             std.heap.c_allocator,
@@ -1433,10 +1441,10 @@ const App = struct {
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
             .model = model_copy,
-            .provider = self.provider_selection.selection().provider,
+            .provider = provider,
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
+            .credential_source = if (gateway_credential) |credential| credential.source else null,
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
@@ -1857,12 +1865,13 @@ const App = struct {
     }
 
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
+        const catalog = if (comptime host_target.is_wasm)
+            js_host_model_catalog.provider
+        else
+            self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return .empty;
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm)
-                js_host_model_catalog.provider
-            else
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+            catalog,
             builtin_gateway.models_path,
         );
     }
@@ -1878,8 +1887,9 @@ const App = struct {
                 self.auth.modelCatalogAccess(),
             );
         } else {
+            const catalog = self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return;
             self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
+                catalog,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -3949,9 +3959,26 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
     }
 }
 
+test "local provider skips unavailable model catalog" {
+    var app = App{ .alloc = std.testing.allocator };
+    app.provider_selection = provider_runtime.Runtime.init(std.testing.allocator);
+    defer app.provider_selection.deinit();
+    defer app.model_cache.deinit();
+
+    var model = try std.testing.allocator.dupe(u8, "local-model");
+    app.provider_selection.adoptOwned(.local, &model);
+    app.startModelCacheWarmup();
+    try std.testing.expect(!app.model_cache.isLoading());
+
+    var ids = try app.fetchModelIds();
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ids.items.len);
+}
+
 test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
+    _ = @import("core/config/local_routing.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
@@ -4017,6 +4044,7 @@ test {
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/openai_compatible.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");

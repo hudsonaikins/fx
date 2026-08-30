@@ -715,6 +715,8 @@ const Reducer = struct {
     events: stream_provider.EventSink,
     available_tools: stream_provider.ToolSelection = .{},
     content: std.ArrayList(u8) = .empty,
+    pending_content: std.ArrayList(u8) = .empty,
+    fallback_candidate: bool = false,
     tools: std.ArrayList(ToolAccumulator) = .empty,
     generation_id: ?[]u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
@@ -728,6 +730,7 @@ const Reducer = struct {
 
     fn deinit(self: *Reducer, alloc: Allocator) void {
         self.content.deinit(alloc);
+        self.pending_content.deinit(alloc);
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
         if (self.generation_id) |id| alloc.free(id);
@@ -771,14 +774,55 @@ const Reducer = struct {
         } });
     }
 
+    fn emitPendingContent(self: *Reducer, keep: usize) void {
+        const emit_len = self.pending_content.items.len - keep;
+        if (emit_len == 0) return;
+        self.events.emit(.{ .content_delta = self.pending_content.items[0..emit_len] });
+        const remaining = self.pending_content.items.len - emit_len;
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                u8,
+                self.pending_content.items[0..remaining],
+                self.pending_content.items[emit_len..],
+            );
+        }
+        self.pending_content.items.len = remaining;
+    }
+
+    fn partialFallbackOpenLength(content: []const u8) usize {
+        var longest: usize = 0;
+        for (fallback_tool_tags) |tag| {
+            const max_len = @min(content.len, tag.open.len - 1);
+            var len = max_len;
+            while (len > longest) : (len -= 1) {
+                if (len > 0 and std.mem.eql(u8, content[content.len - len ..], tag.open[0..len])) {
+                    longest = len;
+                    break;
+                }
+            }
+        }
+        return longest;
+    }
+
+    fn flushPendingContent(self: *Reducer) void {
+        if (self.fallback_candidate) return;
+        if (nextTaggedToolCall(self.pending_content.items, 0)) |tag| {
+            self.fallback_candidate = true;
+            self.emitPendingContent(self.pending_content.items.len - tag.index);
+            return;
+        }
+        self.emitPendingContent(partialFallbackOpenLength(self.pending_content.items));
+    }
+
     fn appendContent(self: *Reducer, alloc: Allocator, value: []const u8, capture_limit: ?usize) !void {
         if (value.len == 0) return;
-        self.events.emit(.{ .content_delta = value });
         const remaining = if (capture_limit) |limit|
             limit -| self.content.items.len
         else
             value.len;
         if (remaining > 0) try self.content.appendSlice(alloc, value[0..@min(remaining, value.len)]);
+        try self.pending_content.appendSlice(alloc, value);
+        self.flushPendingContent();
     }
 
     fn apply(
@@ -865,9 +909,15 @@ const Reducer = struct {
             if (try parseTaggedToolCalls(alloc, self.available_tools, self.content.items)) |fallback_calls| {
                 self.finish_reason = .tool_calls;
                 self.content.items.len = stripTaggedToolCallMarkup(self.content.items);
+                const pending_len = stripTaggedToolCallMarkup(self.pending_content.items);
+                if (pending_len > 0) {
+                    self.events.emit(.{ .content_delta = self.pending_content.items[0..pending_len] });
+                }
+                self.pending_content.items.len = 0;
                 return self.finishFallback(alloc, fallback_calls);
             }
         }
+        self.emitPendingContent(0);
         var tool_calls = try alloc.alloc(types.ToolCall, self.tools.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -1310,6 +1360,64 @@ test "local OpenAI-compatible reducer parses native Liquid Pythonic calls" {
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("after", completion.content.?);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "local OpenAI-compatible reducer hides split fallback tool markup while streaming" {
+    const Capture = struct {
+        fn emit(ctx: *anyopaque, event: stream_provider.Event) void {
+            switch (event) {
+                .content_delta => |value| {
+                    const output: *std.ArrayList(u8) = @ptrCast(@alignCast(ctx));
+                    output.appendSlice(std.testing.allocator, value) catch unreachable;
+                },
+                else => {},
+            }
+        }
+    };
+    const function = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read file",
+        .input_schema = .{},
+    };
+    var streamed: std.ArrayList(u8) = .empty;
+    defer streamed.deinit(std.testing.allocator);
+    var reducer = Reducer.init(
+        .{ .context = &streamed, .emit_fn = Capture.emit },
+        .{ .additional_functions = &.{function} },
+    );
+    defer reducer.deinit(std.testing.allocator);
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    try reducer.apply(
+        std.testing.allocator,
+        "{\"choices\":[{\"delta\":{\"content\":\"before<|tool_call_\"}}]}",
+        &cancelled,
+        null,
+    );
+    try reducer.apply(
+        std.testing.allocator,
+        "{\"choices\":[{\"delta\":{\"content\":\"start|>[read_file(path=\\\"README.md\\\")]<|tool_call_end|>after\"}}]}",
+        &cancelled,
+        null,
+    );
+    try std.testing.expectEqualStrings("before", streamed.items);
+
+    try reducer.apply(
+        std.testing.allocator,
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &cancelled,
+        null,
+    );
+    const completion = try reducer.finish(std.testing.allocator);
+    defer {
+        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
+        if (completion.generation_id) |id| std.testing.allocator.free(@constCast(id));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+    }
+    try std.testing.expectEqualStrings("beforeafter", streamed.items);
+    try std.testing.expect(std.mem.indexOf(u8, streamed.items, "tool_call_start") == null);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("beforeafter", completion.content.?);
 }
 
 test "local OpenAI-compatible reducer parses tagged Python dictionaries" {

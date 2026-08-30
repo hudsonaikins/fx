@@ -6,8 +6,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+try:
+    from .export_fx_trajectories import redact_value
+except ImportError:
+    from export_fx_trajectories import redact_value
 
 
 POST_GRAPHIFY_SYSTEM = (
@@ -403,8 +409,16 @@ def load_records(paths: list[Path]) -> list[dict[str, Any]]:
                 except json.JSONDecodeError as exc:
                     raise SystemExit(f"invalid JSON at {path}:{line_number}: {exc}") from exc
                 if isinstance(value, dict) and isinstance(value.get("messages"), list):
-                    records.append(value)
+                    records.append(sanitize_imported_record(value))
     return records
+
+
+def sanitize_imported_record(value: dict[str, Any]) -> dict[str, Any]:
+    metadata = value.get("metadata")
+    roots = [str(Path.home()), os.environ.get("HOME", ""), os.environ.get("USERPROFILE", "")]
+    if isinstance(metadata, dict) and isinstance(metadata.get("workspace_root"), str):
+        roots.insert(0, metadata["workspace_root"])
+    return redact_value(value, roots)
 
 
 def write_dataset(output: Path, records: list[dict[str, Any]]) -> None:
@@ -434,6 +448,16 @@ def main() -> int:
             if message["role"] == "assistant" and message["content"].startswith("<|tool_call_start|>")
         ]
         assert len(tool_messages) == sum(item["metadata"]["tool_count"] for item in seeds)
+        imported = sanitize_imported_record(
+            {
+                "messages": [{"role": "user", "content": "token=plain-secret"}],
+                "metadata": {"token": "structured-secret", "token_count": 128},
+            }
+        )
+        serialized = json.dumps(imported)
+        assert "plain-secret" not in serialized
+        assert imported["metadata"]["token"] == "<REDACTED>"
+        assert imported["metadata"]["token_count"] == 128
         print(f"self-test=passed seeds={len(seeds)}")
         return 0
 
