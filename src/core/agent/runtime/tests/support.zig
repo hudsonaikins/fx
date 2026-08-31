@@ -1470,7 +1470,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 u8,
                 result.model_output,
             );
-            if (result.prepared_result_memory) |*memory| {
+            if (result.tool_result_memory) |*memory| {
                 if (memory.output_handle) |handle| {
                     memory.output_handle = try request.result_allocator.dupe(
                         u8,

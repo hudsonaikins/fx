@@ -99,7 +99,7 @@ pub fn collect(
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
-        try appendAuthCheck(&checks, alloc, snapshot.auth);
+        try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         try appendStateChecks(&checks, alloc, snapshot.workspace_root);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
@@ -121,7 +121,7 @@ pub fn collect(
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
-    try appendAuthCheck(&checks, alloc, snapshot.auth);
+    try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
         .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
         .permission_mode = detailed.settings.permission_mode,
@@ -200,7 +200,16 @@ fn configLayerRejected(
     return false;
 }
 
-fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot) !void {
+fn appendAuthCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    auth: auth_runtime.StatusSnapshot,
+    provider: model_provider.ProviderId,
+) !void {
+    if (provider == .local) {
+        try appendCheck(checks, alloc, "auth", .ok, "local provider does not require credentials");
+        return;
+    }
     if (auth.missingHelp(.cli)) |help| {
         try appendCheck(checks, alloc, "auth", .fail, help);
         return;

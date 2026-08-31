@@ -322,7 +322,6 @@ pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mo
 pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     if (result.status == .failure) return "error";
     if (result.diff_entry != null) return "diff";
-    if (result.display_output != null) return "display";
     return "model_output";
 }
 

@@ -46,6 +46,7 @@ pub const PreparedToolBlockKind = enum {
     malformed_arguments,
     lifecycle_block,
     lifecycle_failed_closed,
+    local_routing,
     route_unavailable,
     required_vision,
 };
@@ -297,7 +298,7 @@ fn makePreparedBlocked(
             alloc,
             call.name,
         ),
-        .route_unavailable, .required_vision => unreachable,
+        .local_routing, .route_unavailable, .required_vision => unreachable,
     };
     return .{ .blocked = .{
         .call = owned_call,

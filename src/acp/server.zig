@@ -329,12 +329,29 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
     }
 }
 
+fn clearServerCredential(state: *ServerState) void {
+    if (state.active_session) |*active| {
+        active.api_key = &.{};
+        active.credential_source = null;
+        active.account_id = null;
+        if (comptime !host_target.is_wasm) active.session_rt.usage.clearReconciliationCredential();
+    }
+    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
+    if (state.gateway_team) |team| state.alloc.free(team);
+    if (state.account_id) |account_id| state.alloc.free(account_id);
+    state.api_key = &.{};
+    state.gateway_team = null;
+    state.account_id = null;
+    state.credential_source = null;
+}
+
 /// Ensures the process and active ACP session use a credential authorized for
 /// the final model route. Returns false when that route has no credential.
 pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    if (provider == .local) return true;
     if (state.active_session) |active| {
         if (credentialMatchesProvider(active.credential_source, provider)) return true;
     }
@@ -1349,30 +1366,44 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     defer if (startup_credential) |*credential| credential.deinit(alloc);
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_model = if (startup_credential) |credential|
-        credentialMatchesProvider(credential.source, state.provider)
-    else
-        false;
-    const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
-        routed_credential = .{
-            .token = try alloc.dupe(u8, state.cfg.credential_override.?),
-            .source = .ai_gateway_api_key,
+    if (state.provider != .local) {
+        const startup_matches_model = if (startup_credential) |credential|
+            credentialMatchesProvider(credential.source, state.provider)
+        else
+            false;
+        const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
+            routed_credential = .{
+                .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+                .source = .ai_gateway_api_key,
+            };
+            break :override &routed_credential.?;
+        } else if (startup_matches_model)
+            &startup_credential.?
+        else routed: {
+            const preferred = if (startup_credential) |value| value.source else null;
+            const resolution = try credentials.resolveForProvider(
+                alloc,
+                state.cfg.gateway_provider.oauth_transport,
+                state.cfg.secret_store,
+                .refresh_if_needed,
+                state.provider,
+                preferred,
+            );
+            routed_credential = resolution.credential;
+            if (routed_credential == null) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = if (state.provider == .codex)
+                        credentials.missing_chatgpt_credential_message
+                    else if (state.provider == .grok)
+                        credentials.missing_grok_credential_message
+                    else
+                        credentials.missing_credential_message,
+                });
+            }
+            break :routed &routed_credential.?;
         };
-        break :override &routed_credential.?;
-    } else if (startup_matches_model)
-        &startup_credential.?
-    else routed: {
-        const preferred = if (startup_credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
-            .refresh_if_needed,
-            state.provider,
-            preferred,
-        );
-        routed_credential = resolution.credential;
-        if (routed_credential == null) {
+        if (credential.token.len == 0) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
@@ -1383,20 +1414,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                     credentials.missing_credential_message,
             });
         }
-        break :routed &routed_credential.?;
-    };
-    if (credential.token.len == 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (state.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
-        });
+        adoptServerCredential(state, credential);
     }
-    adoptServerCredential(state, credential);
 
     state.permission_mode = startup.permission_mode;
     state.permission_rules = startup.takePermissionRules();
@@ -1416,28 +1435,30 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
     }
 
-    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-    const startup_catalog = catalogProviderFor(state, state.provider) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Selected provider is unavailable in this host",
-        });
-    _ = try state.capability_resolver.resolve(
-        state.alloc,
-        startup_catalog,
-        .{
-            .access = credentials.catalogAccessForCredentialAndAccount(
-                state.credential_source,
-                state.api_key,
-                state.gateway_team,
-                state.account_id,
-            ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        },
-        state.selected_model,
-        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-    );
+    if (state.provider != .local) {
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        const startup_catalog = catalogProviderFor(state, state.provider) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Selected provider is unavailable in this host",
+            });
+        _ = try state.capability_resolver.resolve(
+            state.alloc,
+            startup_catalog,
+            .{
+                .access = credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+                .endpoint = state.cfg.gateway_models_path,
+                .cancel_flag = &catalog_cancel_flag,
+            },
+            state.selected_model,
+            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
+        );
+    }
 
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
@@ -1552,7 +1573,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Invalid session model",
             });
         if (comptime !host_target.is_wasm) {
-            if (session.provider != .gateway) {
+            if (session.provider != .gateway and session.provider != .local) {
                 var model_available = false;
                 if (state.capability_resolver.catalogEntries()) |entries| {
                     for (entries) |entry| {
@@ -1638,101 +1659,128 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Subscription provider switching is unavailable in this WASM runtime",
                 });
             }
-            var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
-                credentials.Credential{
-                    .token = try alloc.dupe(u8, state.cfg.credential_override.?),
-                    .source = .ai_gateway_api_key,
-                }
-            else credential: {
-                const resolution = try credentials.resolveForProvider(
+            if (target == .local) {
+                var settings = if (state.cfg.home_override) |home|
+                    try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
+                else
+                    try config_runtime.loadMergedSettings(alloc, state.workspace_root);
+                defer settings.deinit(alloc);
+                const selected_model = io_mod.getenv("FX_LOCAL_MODEL") orelse
+                    settings.models.get(.local) orelse
+                    @import("../gateway/openai_compatible.zig").default_model;
+                commitActiveSessionProvider(
                     alloc,
-                    state.cfg.gateway_provider.oauth_transport,
-                    state.cfg.secret_store,
-                    .refresh_if_needed,
-                    target,
-                    null,
-                );
-                break :credential resolution.credential orelse
+                    session,
+                    .local,
+                    selected_model,
+                    session_test_controls.logOptions(),
+                ) catch |err| {
+                    if (modelCommitFailureTerminatesConnection(err)) state.terminate_connection = true;
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to persist session provider",
+                    });
+                };
+                state.capability_resolver.deinit(alloc);
+                state.capability_resolver = .{};
+                clearServerCredential(state);
+            } else {
+                var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
+                    credentials.Credential{
+                        .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+                        .source = .ai_gateway_api_key,
+                    }
+                else credential: {
+                    const resolution = try credentials.resolveForProvider(
+                        alloc,
+                        state.cfg.gateway_provider.oauth_transport,
+                        state.cfg.secret_store,
+                        .refresh_if_needed,
+                        target,
+                        null,
+                    );
+                    break :credential resolution.credential orelse
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_request,
+                            .message = if (target == .codex)
+                                credentials.missing_chatgpt_credential_message
+                            else if (target == .grok)
+                                credentials.missing_grok_credential_message
+                            else
+                                credentials.missing_credential_message,
+                        });
+                };
+                defer staged_credential.deinit(alloc);
+                if (!model_provider.authorizesCredential(target, staged_credential.source)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = "Credential cannot authorize the selected provider",
                     });
-            };
-            defer staged_credential.deinit(alloc);
-            if (!model_provider.authorizesCredential(target, staged_credential.source)) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Credential cannot authorize the selected provider",
+                }
+                const catalog_provider = catalogProviderFor(state, target) orelse
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Selected provider is unavailable in this host",
+                    });
+                const access = credentials.catalogAccessForCredentialAndAccount(
+                    staged_credential.source,
+                    staged_credential.token,
+                    staged_credential.gatewayTeam(),
+                    staged_credential.accountId(),
+                );
+                const fetched = try catalog_provider.fetch(alloc, .{
+                    .access = access,
+                    .endpoint = state.cfg.gateway_models_path,
+                    .cancel_flag = &session.cancel_flag,
+                    .view = .picker,
                 });
-            }
-            const catalog_provider = catalogProviderFor(state, target) orelse
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Selected provider is unavailable in this host",
-                });
-            const access = credentials.catalogAccessForCredentialAndAccount(
-                staged_credential.source,
-                staged_credential.token,
-                staged_credential.gatewayTeam(),
-                staged_credential.accountId(),
-            );
-            const fetched = try catalog_provider.fetch(alloc, .{
-                .access = access,
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
-                .view = .picker,
-            });
-            var catalog = switch (fetched) {
-                .catalog => |catalog| catalog,
-                .failure => return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Failed to load provider model catalog",
-                }),
-            };
-            defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (catalog.items.len == 0) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Provider returned no supported models",
-                });
-            }
-            var settings = if (state.cfg.home_override) |home|
-                try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
-            else
-                try config_runtime.loadMergedSettings(alloc, state.workspace_root);
-            defer settings.deinit(alloc);
-            const saved_model = settings.models.get(target);
-            var selected_model = catalog.items[0].id;
-            if (saved_model) |saved| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, entry.id, saved)) {
-                        selected_model = entry.id;
-                        break;
+                var catalog = switch (fetched) {
+                    .catalog => |catalog| catalog,
+                    .failure => return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Failed to load provider model catalog",
+                    }),
+                };
+                defer model_catalog.freeModelCatalog(alloc, &catalog);
+                if (catalog.items.len == 0) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Provider returned no supported models",
+                    });
+                }
+                var settings = if (state.cfg.home_override) |home|
+                    try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
+                else
+                    try config_runtime.loadMergedSettings(alloc, state.workspace_root);
+                defer settings.deinit(alloc);
+                const saved_model = settings.models.get(target);
+                var selected_model = catalog.items[0].id;
+                if (saved_model) |saved| {
+                    for (catalog.items) |entry| {
+                        if (std.mem.eql(u8, entry.id, saved)) {
+                            selected_model = entry.id;
+                            break;
+                        }
                     }
                 }
+                commitActiveSessionProvider(
+                    alloc,
+                    session,
+                    target,
+                    selected_model,
+                    session_test_controls.logOptions(),
+                ) catch |err| {
+                    if (modelCommitFailureTerminatesConnection(err)) {
+                        state.terminate_connection = true;
+                    }
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to persist session provider",
+                    });
+                };
+                state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+                adoptServerCredential(state, &staged_credential);
             }
-            commitActiveSessionProvider(
-                alloc,
-                session,
-                target,
-                selected_model,
-                session_test_controls.logOptions(),
-            ) catch |err| {
-                if (modelCommitFailureTerminatesConnection(err)) {
-                    state.terminate_connection = true;
-                }
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to persist session provider",
-                });
-            };
-            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
-            adoptServerCredential(state, &staged_credential);
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
         if (state.active_session) |*session| {

@@ -274,12 +274,11 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     const tool_name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(tool_name);
 
-    if (execution.background_command != null or
-        execution.diff_entry != null or
+    if (execution.diff_entry != null or
         execution.finish_turn or
         execution.selected_dynamic_tool_name != null or
         execution.selected_dynamic_tool_schema_json != null or
-        execution.prepared_result_memory != null or
+        execution.tool_result_memory_prepared or
         execution.committed_file_handoff != null or
         execution.deferred_tool_completion != null)
     {
@@ -302,9 +301,6 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
-    }
-    if (execution.display_output) |display| {
-        duplicated_execution.display_output = try alloc.dupe(u8, display);
     }
     if (execution.system_notice) |notice| {
         duplicated_execution.system_notice = try alloc.dupe(u8, notice);
@@ -377,7 +373,6 @@ fn freeParallelToolResult(alloc: Allocator, result: ParallelToolResult) void {
 fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) void {
     alloc.free(result.model_output);
     if (result.status_detail) |value| alloc.free(value);
-    if (result.display_output) |value| alloc.free(value);
     if (result.system_notice) |value| alloc.free(value);
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
@@ -708,7 +703,6 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     const execution: ToolExecutionResult = .{
         .model_output = "contents",
         .status_detail = "detail",
-        .display_output = "display",
         .system_notice = "notice",
         .interactive_notice = .{
             .topic = "background",

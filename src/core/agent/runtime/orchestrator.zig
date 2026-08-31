@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const local_routing = @import("../../config/local_routing.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
@@ -25,7 +26,6 @@ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
-const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
 const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
@@ -2770,6 +2770,9 @@ fn processQueuedPromptInner(
     if (config.custom_tool_guidance.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
     }
+    if (local_routing.requiresGraphify(job.provider, job.prompt)) {
+        try stable_prefix.append(arena, .{ .role = .system, .content = local_routing.guidance });
+    }
     if (config.skills_prompt_section.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.skills_prompt_section });
     }
@@ -3084,6 +3087,211 @@ test "vision fallback follows the selected provider capability" {
     );
 }
 
+fn runLocalGraphifyPreflight(
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    job: QueuedPrompt,
+    root_user_intent_context: []const u8,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    local_grants: *std.ArrayList(PermissionGrant),
+    completed_tool_names: *std.ArrayList([]u8),
+    selected_dynamic_tool_names: *std.ArrayList([]const u8),
+    selected_dynamic_tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+) !void {
+    const capability_call: ToolCall = .{
+        .id = "fx_local_graphify_capability",
+        .name = "capability_search",
+        .arguments_json = "{\"query\":\"Graphify repository code architecture\"}",
+    };
+    try runtime_tool_batch.appendAssistantToolCallStep(
+        arena,
+        within_turn_suffix,
+        null,
+        try arena.dupe(ToolCall, &.{capability_call}),
+        null,
+    );
+    const capability_execution = try executeLocalGraphifyCall(
+        deps,
+        config,
+        job,
+        root_user_intent_context,
+        arena,
+        within_turn_suffix,
+        local_grants.items,
+        &.{},
+        capability_call,
+    );
+    try appendLocalGraphifyResult(
+        deps,
+        config,
+        arena,
+        within_turn_suffix,
+        completed_tool_names,
+        capability_call,
+        capability_execution,
+    );
+    if (capability_execution.status != .success) return;
+
+    const select_call: ToolCall = .{
+        .id = "fx_local_graphify_select",
+        .name = "mcp_select_tool",
+        .arguments_json = "{\"name\":\"mcp_graphify_query_graph\"}",
+    };
+    const select_calls = try arena.dupe(ToolCall, &.{select_call});
+    try runtime_tool_batch.appendAssistantToolCallStep(
+        arena,
+        within_turn_suffix,
+        null,
+        select_calls,
+        null,
+    );
+    const select_execution = try executeLocalGraphifyCall(
+        deps,
+        config,
+        job,
+        root_user_intent_context,
+        arena,
+        within_turn_suffix,
+        local_grants.items,
+        &.{},
+        select_call,
+    );
+    try appendLocalGraphifyResult(
+        deps,
+        config,
+        arena,
+        within_turn_suffix,
+        completed_tool_names,
+        select_call,
+        select_execution,
+    );
+    try runtime_gateway_step.recordSelectedDynamicTool(
+        arena,
+        selected_dynamic_tool_names,
+        selected_dynamic_tools,
+        select_execution,
+    );
+    if (select_execution.status != .success or selected_dynamic_tool_names.items.len == 0) return;
+
+    const query_call = try local_routing.repairGraphifyRoutingCall(
+        arena,
+        job.provider,
+        job.prompt,
+        within_turn_suffix.items,
+        .{
+            .id = "fx_local_graphify_query",
+            .name = local_routing.graphify_query_tool,
+            .arguments_json = "{}",
+        },
+    );
+    try runtime_tool_batch.appendAssistantToolCallStep(
+        arena,
+        within_turn_suffix,
+        null,
+        try arena.dupe(ToolCall, &.{query_call}),
+        null,
+    );
+    const query_execution = try executeLocalGraphifyCall(
+        deps,
+        config,
+        job,
+        root_user_intent_context,
+        arena,
+        within_turn_suffix,
+        local_grants.items,
+        selected_dynamic_tool_names.items,
+        query_call,
+    );
+    try appendLocalGraphifyResult(
+        deps,
+        config,
+        arena,
+        within_turn_suffix,
+        completed_tool_names,
+        query_call,
+        query_execution,
+    );
+}
+
+fn executeLocalGraphifyCall(
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    job: QueuedPrompt,
+    root_user_intent_context: []const u8,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    session_grants: []const PermissionGrant,
+    advertised_dynamic_tool_names: []const []const u8,
+    call: ToolCall,
+) !ToolExecutionResult {
+    return deps.execute_tool_call(deps.ctx, .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = call,
+        .authority = .ordinary,
+        .permission_mode = job.permission_mode,
+        .root_user_intent_context = root_user_intent_context,
+        .root_user_messages = &.{},
+        .root_user_evidence_complete = true,
+        .current_turn_messages = within_turn_suffix.items,
+        .session_grants = session_grants,
+        .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+        .max_tool_result_bytes = config.max_tool_result_bytes,
+        .classification_complete = false,
+        .lifecycle_id = null,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .status = .failure,
+            .model_output = try deps.format_tool_execution_error(
+                deps.ctx,
+                arena,
+                call.name,
+                err,
+            ),
+        };
+    };
+}
+
+fn appendLocalGraphifyResult(
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    completed_tool_names: *std.ArrayList([]u8),
+    call: ToolCall,
+    execution: ToolExecutionResult,
+) !void {
+    for (execution.context_notices) |notice| try deps.pushContextNotice(notice);
+    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+        arena,
+        config,
+        call,
+        execution.model_output,
+    );
+    runtime_execution_memory.applyToolResultMemory(&prepared.memory, execution.tool_result_memory);
+    var batch = runtime_tool_batch.StepBatchState{};
+    try runtime_tool_batch.appendToolResultContent(
+        arena,
+        within_turn_suffix,
+        completed_tool_names,
+        &batch,
+        call,
+        prepared.model_output,
+        prepared.memory,
+        .{
+            .increment_error = execution.status == .failure or
+                tool_result_errors.isToolOutputError(prepared.model_output),
+            .record_completion = true,
+            .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
+                execution.status,
+                prepared.model_output,
+            ),
+        },
+    );
+}
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -3150,6 +3358,8 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    var local_routing_continuation_injected = false;
+    var local_inspection_continuation_injected = false;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -3157,6 +3367,28 @@ fn processQueuedPromptLoop(
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    var local_preflight_tool_names: std.ArrayList([]const u8) = .empty;
+    var local_preflight_functions: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    var local_inspection_tool_names: std.ArrayList([]const u8) = .empty;
+    var local_inspection_functions: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    var local_inspection_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
+    var local_inspection_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    if (local_routing.requiresGraphify(job.provider, job.prompt) and
+        !local_routing.hasSuccessfulGraphifyRetrieval(within_turn_suffix.items))
+    {
+        try runLocalGraphifyPreflight(
+            deps,
+            config,
+            job,
+            root_user_intent_context,
+            arena,
+            &within_turn_suffix,
+            &local_grants,
+            &completed_tool_names,
+            &selected_dynamic_tool_names,
+            &selected_dynamic_tools,
+        );
+    }
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
@@ -3297,7 +3529,7 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tool_names = selected_dynamic_tool_names.items;
+        var advertised_dynamic_tool_names: []const []const u8 = selected_dynamic_tool_names.items;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
         var gateway_model: []const u8 = job.model;
@@ -3495,12 +3727,101 @@ fn processQueuedPromptLoop(
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            const local_graphify_preflight = local_routing.requiresGraphify(job.provider, job.prompt) and
+                !local_routing.hasSuccessfulGraphifyRetrieval(within_turn_suffix.items);
+            const local_inspection_phase = local_routing.requiresLocalInspection(job.provider, job.prompt) and
+                local_routing.hasSuccessfulGraphifyRetrieval(within_turn_suffix.items) and
+                !local_routing.hasSuccessfulLocalInspection(within_turn_suffix.items);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
+            else if (local_graphify_preflight)
+                .required
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
             else
                 .auto;
+            const local_graphify_capability_searched = local_routing.hasSuccessfulTool(
+                within_turn_suffix.items,
+                "capability_search",
+            );
+            local_preflight_tool_names.clearRetainingCapacity();
+            local_preflight_functions.clearRetainingCapacity();
+            local_inspection_tool_names.clearRetainingCapacity();
+            local_inspection_functions.clearRetainingCapacity();
+            local_inspection_dynamic_tool_names.clearRetainingCapacity();
+            local_inspection_dynamic_tools.clearRetainingCapacity();
+            if (local_graphify_preflight) {
+                if (selected_dynamic_tool_names.items.len == 0) {
+                    for (config.advertised_tool_names) |name| {
+                        if (!local_routing.isGraphifyPreflightTool(name)) continue;
+                        if (local_graphify_capability_searched and
+                            !std.mem.eql(u8, name, "mcp_select_tool")) continue;
+                        try local_preflight_tool_names.append(arena, name);
+                    }
+                    for (config.advertised_functions) |function| {
+                        if (!local_routing.isGraphifyPreflightTool(function.name)) continue;
+                        if (local_graphify_capability_searched and
+                            !std.mem.eql(u8, function.name, "mcp_select_tool")) continue;
+                        try local_preflight_functions.append(arena, function);
+                    }
+                }
+            }
+            if (local_inspection_phase) {
+                const read_only_inspection = local_routing.isReadOnlyInspection(job.prompt);
+                const terminal_only_request = local_routing.isTerminalOnlyRequest(job.prompt);
+                var matched_read_only_tool = false;
+                if (read_only_inspection) {
+                    for (config.advertised_tool_names) |name| {
+                        if (local_routing.readOnlyToolMatchesPrompt(job.prompt, name)) {
+                            matched_read_only_tool = true;
+                            break;
+                        }
+                    }
+                }
+                for (config.advertised_tool_names) |name| {
+                    if (local_routing.isGraphifyRetrievalTool(name) or local_routing.isDiscoveryTool(name)) continue;
+                    if (terminal_only_request and !std.mem.eql(u8, name, "terminal")) continue;
+                    if (read_only_inspection and !terminal_only_request and
+                        (matched_read_only_tool and !local_routing.readOnlyToolMatchesPrompt(job.prompt, name) or
+                            !matched_read_only_tool and !local_routing.isReadOnlyLocalInspectionTool(name))) continue;
+                    try local_inspection_tool_names.append(arena, name);
+                }
+                for (config.advertised_functions) |function| {
+                    if (local_routing.isGraphifyRetrievalTool(function.name) or local_routing.isDiscoveryTool(function.name)) continue;
+                    if (terminal_only_request and !std.mem.eql(u8, function.name, "terminal")) continue;
+                    if (read_only_inspection and !terminal_only_request and
+                        (matched_read_only_tool and !local_routing.readOnlyToolMatchesPrompt(job.prompt, function.name) or
+                            !matched_read_only_tool and !local_routing.isReadOnlyLocalInspectionTool(function.name))) continue;
+                    try local_inspection_functions.append(arena, function);
+                }
+                for (selected_dynamic_tool_names.items, selected_dynamic_tools.items) |name, tool| {
+                    if (local_routing.isGraphifyRetrievalTool(name) or local_routing.isDiscoveryTool(name) or
+                        !local_routing.isLocalInspectionTool(name)) continue;
+                    if (terminal_only_request and !std.mem.eql(u8, name, "terminal")) continue;
+                    try local_inspection_dynamic_tool_names.append(arena, name);
+                    try local_inspection_dynamic_tools.append(arena, tool);
+                }
+            }
+            const advertised_tool_names = if (local_graphify_preflight)
+                local_preflight_tool_names.items
+            else if (local_inspection_phase)
+                local_inspection_tool_names.items
+            else
+                config.advertised_tool_names;
+            const advertised_functions = if (local_graphify_preflight)
+                local_preflight_functions.items
+            else if (local_inspection_phase)
+                local_inspection_functions.items
+            else
+                config.advertised_functions;
+            advertised_dynamic_tool_names = if (local_inspection_phase)
+                local_inspection_dynamic_tool_names.items
+            else
+                selected_dynamic_tool_names.items;
+            const advertised_selected_dynamic_tools = if (local_inspection_phase)
+                local_inspection_dynamic_tools.items
+            else
+                selected_dynamic_tools.items;
             var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
             if (job.provider != .gateway and job.images.len > 0 and
                 request_capabilities.supports_vision and request_capabilities.supports_file_input)
@@ -3567,9 +3888,9 @@ fn processQueuedPromptLoop(
                 .messages = request_messages,
                 .tools = .{
                     .registry = deps.tool_registry,
-                    .advertised_names = config.advertised_tool_names,
-                    .advertised_functions = config.advertised_functions,
-                    .selected_dynamic = selected_dynamic_tools.items,
+                    .advertised_names = advertised_tool_names,
+                    .advertised_functions = advertised_functions,
+                    .selected_dynamic = advertised_selected_dynamic_tools,
                 },
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
@@ -4931,6 +5252,34 @@ fn processQueuedPromptLoop(
         }
 
         if (completion.tool_calls.len == 0) {
+            if (local_routing.blocksFinalResponse(job.provider, job.prompt, within_turn_suffix.items)) {
+                if (!local_routing.hasSuccessfulGraphifyRetrieval(within_turn_suffix.items)) {
+                    if (local_routing_continuation_injected) {
+                        finish_trace.finish("local_graphify_required");
+                        return error.LocalGraphifyRetrievalRequired;
+                    }
+                    local_routing_continuation_injected = true;
+                    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = completion.content });
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = local_routing.continuation });
+                    continue;
+                }
+                if (local_routing.requiresLocalInspection(job.provider, job.prompt) and
+                    !local_routing.hasSuccessfulLocalInspection(within_turn_suffix.items))
+                {
+                    if (local_inspection_continuation_injected) {
+                        finish_trace.finish("local_inspection_required");
+                        return error.LocalInspectionRequired;
+                    }
+                    local_inspection_continuation_injected = true;
+                    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = completion.content });
+                    const inspection_prompt = if (local_routing.isTerminalOnlyRequest(job.prompt))
+                        local_routing.terminal_continuation
+                    else
+                        local_routing.inspection_continuation;
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = inspection_prompt });
+                    continue;
+                }
+            }
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
             const needs_continuation =
@@ -5071,7 +5420,69 @@ fn processQueuedPromptLoop(
             PreparedToolCall,
             completion.tool_calls.len,
         );
-        for (completion.tool_calls, 0..) |tool_call, tool_call_index| {
+        for (completion.tool_calls, 0..) |model_tool_call, tool_call_index| {
+            var tool_call = try local_routing.repairGraphifyRoutingCall(
+                arena,
+                job.provider,
+                job.prompt,
+                within_turn_suffix.items,
+                model_tool_call,
+            );
+            tool_call = try local_routing.repairTerminalExecutionCall(
+                arena,
+                job.provider,
+                job.prompt,
+                tool_call,
+            );
+            const blocks_local_routing = local_routing.blocksBeforeGraphify(
+                job.provider,
+                job.prompt,
+                within_turn_suffix.items,
+                tool_call.name,
+            ) or local_routing.blocksRedundantGraphifySelection(
+                arena,
+                job.provider,
+                job.prompt,
+                within_turn_suffix.items,
+                tool_call,
+            );
+            const blocks_terminal_only = local_routing.blocksTerminalOnlyTool(
+                job.provider,
+                job.prompt,
+                within_turn_suffix.items,
+                tool_call.name,
+            );
+            if (blocks_local_routing or blocks_terminal_only) {
+                const graphify_already_completed =
+                    local_routing.hasSuccessfulGraphifyRetrieval(within_turn_suffix.items) and
+                    (local_routing.isGraphifyRetrievalTool(tool_call.name) or
+                        local_routing.selectsGraphifyQuery(arena, tool_call));
+                const owned_call = try types.dupeToolCall(arena, tool_call);
+                errdefer types.freeToolCall(arena, owned_call);
+                prepared_tool_calls[tool_call_index] = .{ .blocked = .{
+                    .call = owned_call,
+                    .model_output = try tool_result_errors.toolExecutionFailureJson(
+                        arena,
+                        .{
+                            .tool_name = tool_call.name,
+                            .message = if (blocks_terminal_only)
+                                "This request is execution-only; use terminal with action=exec."
+                            else if (graphify_already_completed)
+                                "Graphify retrieval already completed; use a local inspection tool now."
+                            else
+                                "Local repository routing requires Graphify retrieval before inspection or execution.",
+                            .suggestion = if (blocks_terminal_only)
+                                "Call terminal with the exact requested command and a finite timeout_ms."
+                            else if (graphify_already_completed)
+                                "Call read_file, grep_files, glob_files, list_files, semantic_search, or terminal."
+                            else
+                                "Call capability_search, select mcp_graphify_query_graph with mcp_select_tool, then call it.",
+                        },
+                    ),
+                    .kind = .local_routing,
+                } };
+                continue;
+            }
             if (successful_vision_mode == .required and
                 !std.mem.eql(u8, tool_call.name, "vision"))
             {
@@ -7294,7 +7705,7 @@ fn processQueuedPromptLoop(
                 }
                 continue;
             }
-            if (execution.prepared_result_memory != null or
+            if (execution.tool_result_memory_prepared or
                 execution.deferred_tool_completion != null)
             {
                 return error.InvalidPreparedToolExecutionResult;
@@ -7311,8 +7722,6 @@ fn processQueuedPromptLoop(
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
-            } else if (execution.display_output) |display| {
-                try deps.push_text(deps.ctx, .{ .operational = display });
             }
             var replay_handed_off = execution.command_replay_capture == null;
             defer if (!replay_handed_off) {
@@ -7427,37 +7836,21 @@ fn processQueuedPromptLoop(
                 else
                     "";
                 stop_state.terminal_materializing = true;
-                if (execution.background_command) |background| {
-                    try finishCommonBackgroundTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        background,
-                        &finish_trace,
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                } else {
-                    try finishCommonAssistantTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        .completed,
-                        null,
-                        &finish_trace,
-                        "tool",
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                }
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    assistant_text,
+                    .completed,
+                    null,
+                    &finish_trace,
+                    "tool",
+                );
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
                 return;
             }
 
@@ -7835,49 +8228,6 @@ fn finishCommonAssistantTerminalWithExecution(
         finish_trace,
         trace_outcome,
     );
-}
-
-fn finishCommonBackgroundTerminal(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    background: command_contract.BackgroundCommand,
-    finish_trace: *PromptFinishTrace,
-) !void {
-    const execution_memory = try runtime_execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    const completed_summary = summary_accumulator.finish();
-    var turn: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(assistant_text),
-        .execution = execution_memory,
-        .log_path = @constCast(background.log_path),
-        .expect_url = background.expect_url,
-        .url = if (background.url) |url| @constCast(url) else null,
-        .background_record_id = background.background_record_id,
-    } };
-    types.setHistoryTurnSummary(&turn, completed_summary);
-    const finished = try types.dupeFinishedPrompt(
-        std.heap.c_allocator,
-        .{
-            .turn = turn,
-            .summary = completed_summary,
-        },
-    );
-
-    var propagation_error: ?anyerror = null;
-    deps.propagate_history_turn(deps.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
-    try finalization.finish(.completed, null, finished);
-    finish_trace.finish("background");
-    if (propagation_error) |err| return err;
 }
 
 pub fn copyLatestStopPartial(

@@ -565,7 +565,9 @@ fn executeWorkspaceToolCallInner(
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     dispatch_ctx.run_command_backend = .{
@@ -576,15 +578,16 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
         return err;
     }
     var execution = command_backend.completion orelse
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -677,7 +680,9 @@ fn executeRegisteredTool(
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
@@ -719,6 +724,7 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -738,9 +744,9 @@ fn executeRegisteredTool(
     else if (vision_provider.completion) |completion|
         completion
     else
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -793,24 +799,42 @@ fn executeRunCommandBackend(
     };
 }
 
-fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExecutionResult {
+const DispatchMetadata = struct {
+    status_detail: ?[]u8 = null,
+    inner_usage: ?types.ToolUsage = null,
+    web_search_completion: ?types.WebSearchCompletion = null,
+    web_fetch_completion: ?types.WebFetchCompletion = null,
+    tool_result_memory: ?types.ToolResultMemory = null,
+
+    fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.inner_usage_sink = &self.inner_usage;
+        ctx.web_search_completion_sink = &self.web_search_completion;
+        ctx.web_fetch_completion_sink = &self.web_fetch_completion;
+        ctx.tool_result_memory_sink = &self.tool_result_memory;
+    }
+};
+
+fn toolExecutionResultFromDispatch(
+    result: tool_dispatch.AuthorizedDispatchResult,
+    metadata: DispatchMetadata,
+) ToolExecutionResult {
     return switch (result.status) {
         .success => .{
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
     };
 }
@@ -5208,7 +5232,8 @@ test "file mutation lifecycle decodes each call at most once" {
         applied.status,
     );
     try std.testing.expect(applied.committed_file_handoff != null);
-    try std.testing.expect(applied.prepared_result_memory != null);
+    try std.testing.expect(applied.tool_result_memory_prepared);
+    try std.testing.expect(applied.tool_result_memory != null);
     call_arena_state.deinit();
     call_arena_live = false;
     try std.testing.expectEqualStrings(

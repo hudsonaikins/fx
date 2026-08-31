@@ -376,6 +376,10 @@ fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
 }
 
+fn authLabel(provider: model_provider.ProviderId, auth: auth_runtime.StatusSnapshot) []const u8 {
+    return if (provider == .local) "not_required" else auth.activeSourceLabel();
+}
+
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
     var wrote_provider = false;
     if (gatewayProviderConnected(auth)) {
@@ -513,7 +517,7 @@ pub const StatusSnapshot = struct {
                 .{warning.additional_matches},
             );
         }
-        try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
+        try out.writer.print("[status] auth={s}\n", .{authLabel(self.provider, self.auth)});
         if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
@@ -549,7 +553,7 @@ pub const StatusSnapshot = struct {
         if (self.build_revision.len > 0) {
             try out.writer.print("build_revision={s}\n", .{self.build_revision});
         }
-        try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
+        try out.writer.print("auth={s}\n", .{authLabel(self.provider, self.auth)});
         if (self.provider != .gateway) {
             try out.writer.writeAll("connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
@@ -607,7 +611,7 @@ pub const StatusSnapshot = struct {
             );
         }
         try writer.writeAll(",\"auth\":");
-        try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
+        try std.json.Stringify.value(authLabel(self.provider, self.auth), .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
@@ -852,6 +856,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .local => provider_catalog.label(.local),
         };
     }
 
@@ -1333,7 +1338,7 @@ pub const DoctorSnapshot = struct {
         if (self.provider != .gateway) {
             try out.writer.print("[doctor] model_source={s}\n", .{provider_catalog.label(self.provider)});
         }
-        try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
+        try out.writer.print("[doctor] auth={s}\n", .{authLabel(self.provider, self.auth)});
         try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
         if (self.auth.expired) try out.writer.writeAll("[doctor] auth_expired=true\n");
         if (self.auth.team) |team| {
@@ -1377,7 +1382,7 @@ pub const DoctorSnapshot = struct {
             try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
-        try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
+        try std.json.Stringify.value(authLabel(self.provider, self.auth), .{}, writer);
         try writer.print(",\"auth_refreshable\":{}", .{self.auth.refreshable()});
         if (self.auth.expired) try writer.writeAll(",\"auth_expired\":true");
         if (self.auth.team) |team| {

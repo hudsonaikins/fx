@@ -53,6 +53,29 @@ The OpenAI Codex route uses ChatGPT subscription access directly and never sends
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
+For local inference, run any OpenAI-compatible loopback server such as LM Studio, llama.cpp, or SGLang, then select the local route:
+
+```bash
+lms load 'lfm2.5-8b-a1b@q4_k_m' --gpu max --context-length 128000 --parallel 1 --identifier lfm-q4-128k --yes
+export FX_LOCAL_CHAT_URL=http://127.0.0.1:1234/v1/chat/completions
+export FX_LOCAL_MODEL=lfm-q4-128k
+fx provider local
+fx
+```
+
+`FX_LOCAL_API_KEY` is optional. Use the model's maximum 128K context for fx's tool catalog and multi-step coding turns; `--parallel 1` preserves VRAM for KV cache. Local inference sends tool schemas through Chat Completions and keeps MCP servers in fx's existing tool runtime; Graphify can supply retrieval when exposed through an MCP endpoint or thin adapter. Local model catalogs and billing are unavailable; set model IDs manually. Use a stronger provider for broad code changes and the local route for bounded search, retrieval, and tool-heavy turns until a task-aware router has evaluation coverage.
+
+The local route requires loopback URLs by default. For WSL2 connecting to a Windows-hosted server, bind LM Studio to the WSL gateway address and set `FX_LOCAL_ALLOW_NON_LOOPBACK=1` alongside `FX_LOCAL_CHAT_URL`; this is an explicit network exposure opt-in.
+
+Training trajectories, adapters, checkpoints, and compiled caches stay outside this repository. Use local paths through `FX_TRAJECTORY_DATASET` and `FX_UNSLOTH_OUTPUT`; publish model artifacts separately only after privacy, license, and size review.
+
+Use `FX_LOCAL_MODEL` per invocation to switch roles without changing saved settings:
+
+```bash
+FX_LOCAL_MODEL=lfm-q4-128k fx ask "Search the repository for the auth boundary and summarize relevant files."
+FX_LOCAL_MODEL=gpt-oss-20b fx ask "Implement the requested multi-file change and run focused tests."
+```
+
 To use an AI Gateway API key instead:
 
 ```bash

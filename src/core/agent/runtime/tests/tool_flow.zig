@@ -4727,31 +4727,6 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
     try expectBodyContains(&gateway, 1, "browser_cdp_error");
 }
 
-test "processQueuedPrompt pushes display output but returns only masked model output to model" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "TOKEN=abcdefghijklmnop",
-        .display_output = "DISPLAY ONLY",
-    } }};
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expect(textContains(&hooks, "DISPLAY ONLY"));
-    try expectBodyContains(&gateway, 1, "TOKEN=[redacted]");
-    try expectBodyNotContains(&gateway, 1, "TOKEN=abcdefghijklmnop");
-    try expectBodyNotContains(&gateway, 1, "DISPLAY ONLY");
-}
-
 test "processQueuedPrompt caps chatty grep_files model output" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "grep_files", "{\"pattern\":\"x\"}")};
@@ -4817,7 +4792,6 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
         .model_output = "patched",
-        .display_output = "SHOULD NOT PUSH",
         .diff_entry = .{
             .preview = @constCast("diff preview"),
         },
@@ -4829,7 +4803,6 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.diff_count);
     try std.testing.expectEqualStrings("diff preview", hooks.diff_preview.?);
-    try std.testing.expect(!textContains(&hooks, "SHOULD NOT PUSH"));
 }
 
 test "processQueuedPrompt records permission preflight failures as denied tool calls" {

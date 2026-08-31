@@ -1444,9 +1444,10 @@ fn projectResult(
 
 pub fn mapAuthorizedResult(
     alloc: Allocator,
-    result: tool_dispatch.DispatchResult,
-) Allocator.Error!tool_dispatch.DispatchResult {
-    if (result.status != .failure or result.status_detail != null) return result;
+    result: tool_dispatch.AuthorizedDispatchResult,
+    status_detail: *?[]u8,
+) Allocator.Error!tool_dispatch.AuthorizedDispatchResult {
+    if (result.status != .failure or status_detail.* != null) return result;
     var parsed = std.json.parseFromSlice(
         contracts.Result,
         alloc,
@@ -1461,12 +1462,11 @@ pub fn mapAuthorizedResult(
         .success => return result,
         .failure => |failure| failure.code,
     };
-    var mapped = result;
-    mapped.status_detail = try alloc.dupe(
+    status_detail.* = try alloc.dupe(
         u8,
         terminalFailurePresentation(code).detail(),
     );
-    return mapped;
+    return result;
 }
 
 fn structuredFailure(
@@ -2580,19 +2580,21 @@ test "terminal result mapper adds detail for actionable failures" {
 
     for (cases) |case| {
         const body = try alloc.dupe(u8, case.body);
+        var status_detail: ?[]u8 = null;
+        defer if (status_detail) |detail| alloc.free(detail);
         var mapped = try mapAuthorizedResult(alloc, .{
             .status = case.status,
             .body = body,
-        });
+        }, &status_detail);
         defer mapped.deinit(alloc);
         try std.testing.expectEqualStrings(case.body, mapped.body);
         if (case.expected_detail) |expected| {
             try std.testing.expectEqualStrings(
                 expected,
-                mapped.status_detail orelse return error.TestExpectedDetail,
+                status_detail orelse return error.TestExpectedDetail,
             );
         } else {
-            try std.testing.expect(mapped.status_detail == null);
+            try std.testing.expect(status_detail == null);
         }
     }
 }

@@ -63,11 +63,11 @@ const web_search_description =
 const terminal_description =
     "Each terminal call accepts one action object, never an array. Emit independent actions as separate tool calls together. Set unused fields null. Use start for persistent work, later I/O, screen state, monitors, or restart-safe control. Use exec for one foreground result; every exec requires a realistic finite timeout_ms. exec/start default profile=user; clean skips startup files; start.shell replaces profile. Send one write payload to an existing persistent session; fx acquires and releases agent control around that write. Then wait for a completion marker and read only unread output. Avoid extra verification commands when the marker reports success. Timeouts stop the process group and tracked descendants with a recoverable failure; fully detached descendant cleanup is best effort on macOS. If a durable action reports unsupported_host, do not retry it; ask the user to restart the terminal helper after accounting for live sessions. Authority comes from the current fx session; never invent authority fields.";
 const terminal_exec_only_description =
-    "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.";
+    "Run one captured command with a required finite timeout_ms and return its result. When the user gives a command, preserve it exactly; do not invent a replacement command or path. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.";
 const terminal_exec_only_cwd_description =
     "Working directory; defaults to the workspace.";
 const terminal_exec_only_command_description =
-    "Command to run.";
+    "Exact command requested by the user. Do not substitute or invent commands.";
 const terminal_exec_only_profile_description =
     "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile.";
 const terminal_exec_only_timeout_description =
@@ -1299,7 +1299,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "78bae309e49a98de909b02c678573cb97d263ca5ffd3d1f184e6d5924835c12e",
         &actual_hex,
     );
 }
@@ -1352,6 +1352,13 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn expectStringSlices(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_value, actual_value| {
+        try std.testing.expectEqualStrings(expected_value, actual_value);
+    }
+}
+
 fn terminal_action_schema(action: terminal_impl.Action) model_tool_schema.ObjectSchema {
     std.debug.assert(action != .write);
     for (terminal_action_model_tool_schemas) |branch| {
@@ -1379,7 +1386,7 @@ test "terminal tool schema derives closed action branches and exact write states
     try std.testing.expectEqualStrings("request", input_schema.properties[0].name);
     try std.testing.expectEqual(model_tool_schema.JsonType.object, input_schema.properties[0].json_type);
     try std.testing.expectEqual(@as(usize, 0), input_schema.one_of.len);
-    try std.testing.expectEqualSlices([]const u8, &.{"request"}, input_schema.required);
+    try expectStringSlices(&.{"request"}, input_schema.required);
     try std.testing.expectEqual(@as(?bool, false), input_schema.additional_properties);
 
     try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, terminal_action_model_tool_schemas.len);
@@ -1390,16 +1397,15 @@ test "terminal tool schema derives closed action branches and exact write states
         try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
         try std.testing.expectEqual(@as(usize, 0), branch.one_of.len);
         try std.testing.expectEqual(contract.allowed.len, branch.properties.len);
-        try std.testing.expectEqualSlices([]const u8, contract.allowed, branch.required);
+        try std.testing.expectEqual(contract.allowed.len, branch.required.len);
+        for (contract.allowed, branch.required) |expected, actual| {
+            try std.testing.expectEqualStrings(expected, actual);
+        }
         for (contract.allowed, branch.properties) |field_name, property| {
             try std.testing.expectEqualStrings(field_name, property.name);
             if (std.mem.eql(u8, field_name, "action")) {
                 try std.testing.expect(property.nullable == null);
-                try std.testing.expectEqualSlices(
-                    []const u8,
-                    &.{@tagName(action)},
-                    schemaEnumValues(property),
-                );
+                try expectStringSlices(&.{@tagName(action)}, schemaEnumValues(property));
                 continue;
             }
             try std.testing.expectEqual(
@@ -1419,11 +1425,7 @@ test "terminal tool schema derives closed action branches and exact write states
 
     try std.testing.expectEqual(@as(usize, 1), terminal_write_action_model_tool_schemas.len);
     const write_use_schema = terminal_write_action_model_tool_schemas[0];
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "action", "session_id", "input" },
-        write_use_schema.required,
-    );
+    try expectStringSlices(&.{ "action", "session_id", "input" }, write_use_schema.required);
     try std.testing.expectEqual(@as(usize, 3), write_use_schema.properties.len);
     try std.testing.expect(schemaProperty(write_use_schema, "lease") == null);
     try std.testing.expect(schemaProperty(write_use_schema, "write") == null);
@@ -1434,7 +1436,7 @@ test "terminal tool schema derives closed action branches and exact write states
     const expected_input_fields = [_][]const u8{ "text", "keys", "controls", "paste" };
     for (write_input_schema.one_of, expected_input_fields) |alternative, field_name| {
         try std.testing.expectEqual(@as(?bool, false), alternative.additional_properties);
-        try std.testing.expectEqualSlices([]const u8, &.{field_name}, alternative.required);
+        try expectStringSlices(&.{field_name}, alternative.required);
         try std.testing.expectEqual(@as(usize, 1), alternative.properties.len);
         try std.testing.expectEqualStrings(field_name, alternative.properties[0].name);
         try std.testing.expect(schemaProperty(alternative, "kind") == null);
@@ -1467,8 +1469,7 @@ test "terminal tool schema derives closed action branches and exact write states
     try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), exec_timeout.bounds.?.minimum);
     try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), exec_timeout.bounds.?.maximum);
     try std.testing.expect(exec_timeout.nullable == null);
-    try std.testing.expectEqualSlices(
-        []const u8,
+    try expectStringSlices(
         &.{ "native", "tmux" },
         schemaEnumValues(schemaProperty(start_schema, "backend").?),
     );
@@ -1547,8 +1548,7 @@ test "terminal exec-only schema reuses exec structure with focused descriptions"
     for (terminal_exec_contract.allowed, input_schema.properties) |field_name, property| {
         try std.testing.expectEqualStrings(field_name, property.name);
     }
-    try std.testing.expectEqualSlices(
-        []const u8,
+    try expectStringSlices(
         &terminal_exec_only_actions,
         schemaEnumValues(schemaProperty(input_schema, "action").?),
     );
@@ -2655,6 +2655,8 @@ test "built-in vision dispatch uses supplied runtime provider" {
 
     var fixture = Fixture{};
     const vision_registry = tool_dispatch.Registry{ .tools = &.{vision} };
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .vision_provider = .{
@@ -2665,7 +2667,7 @@ test "built-in vision dispatch uses supplied runtime provider" {
         .id = "vision_1",
         .name = "vision",
         .arguments_json = "{\"image_ids\":[7,9],\"focus\":\"read status\"}",
-    });
+    }, &status_detail);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
