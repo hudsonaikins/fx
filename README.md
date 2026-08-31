@@ -67,6 +67,8 @@ fx
 
 The local route requires loopback URLs by default. For WSL2 connecting to a Windows-hosted server, bind LM Studio to the WSL gateway address and set `FX_LOCAL_ALLOW_NON_LOOPBACK=1` alongside `FX_LOCAL_CHAT_URL`; this is an explicit network exposure opt-in.
 
+Training trajectories, adapters, checkpoints, and compiled caches stay outside this repository. Use local paths through `FX_TRAJECTORY_DATASET` and `FX_UNSLOTH_OUTPUT`; publish model artifacts separately only after privacy, license, and size review.
+
 Use `FX_LOCAL_MODEL` per invocation to switch roles without changing saved settings:
 
 ```bash
